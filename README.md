@@ -102,7 +102,7 @@ We recommend to install mumax⁺ in a clean conda environment as follows. You co
 
 ```bash
 conda env create -f environment.yml
-conda activate mumaxplus
+conda activate mumaxross
 ```
 
 Finally, build and install mumax⁺ using pip.
