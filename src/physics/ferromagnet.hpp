@@ -58,6 +58,7 @@ class Ferromagnet : public Magnet {
   bool enableSlonczewskiTorque;
   bool fixedLayerOnTop;
   VectorParameter anisU;
+  VectorParameter anisU_prime;
   VectorParameter anisC1;
   VectorParameter anisC2;
   VectorParameter jcur;
@@ -72,6 +73,7 @@ class Ferromagnet : public Magnet {
   InterParameter scaleExch;
   Parameter ku1;
   Parameter ku2;
+  Parameter ku1_prime;
   Parameter kc1;
   Parameter kc2;
   Parameter kc3;

@@ -68,6 +68,95 @@ class TestUniaxialAnisotropy:
         relative_error = (result - wanted) / wanted
         assert relative_error < RTOL
 
+# --- Prime Uniaxial Anisotropy ---
+
+def compute_uni_prime_anisotropy_field(magnet):
+    """Computes the prime uniaxial anisotropy field contribution."""
+    ku1_prime = magnet.ku1_prime.eval()
+    msat = magnet.msat.eval()
+    u_prime = magnet.anisU_prime.eval()
+    u_prime /= np.sqrt(np.sum(u_prime * u_prime, axis=0))
+    m = magnet.magnetization.get()
+    mu = np.sum(m * u_prime, axis=0)
+    return (2 * ku1_prime * mu) * u_prime / msat
+
+
+def compute_uni_prime_anisotropy_energy_density(magnet):
+    """Computes the prime uniaxial anisotropy energy density."""
+    ku1_prime = magnet.ku1_prime.eval()
+    u_prime = magnet.anisU_prime.eval()
+    u_prime /= np.sqrt(np.sum(u_prime * u_prime, axis=0))
+    m = magnet.magnetization.get()
+    mu = np.sum(m * u_prime, axis=0)
+    return -ku1_prime * mu ** 2
+
+
+def compute_uni_prime_anisotropy_energy(magnet):
+    edens = compute_uni_prime_anisotropy_energy_density(magnet)
+    (cx, cy, cz) = magnet.cellsize
+    return np.sum(edens) * cx * cy * cz
+
+
+class TestUniPrimeAnisotropy:
+    """Test quantities related to the second uniaxial anisotropy (ku1_prime)."""
+
+    def setup_class(self):
+        self.world = World(cellsize=(1e-9, 2e-9, 4e-9))
+        self.magnet = Ferromagnet(self.world, Grid((16, 32, 4)))
+        self.magnet.msat = 800e3
+        self.magnet.ku1_prime = 3.5e6
+        self.magnet.anisU_prime = (0.6, 0.7, 0.2)
+
+    def test_anisotropy_field(self):
+        result = (self.magnet.anisotropy_field(),)
+        wanted = compute_uni_prime_anisotropy_field(self.magnet)
+        assert max_relative_error(result, wanted) < RTOL
+
+    def test_anisotropy_energy_density(self):
+        result = (self.magnet.anisotropy_energy_density(),)
+        wanted = compute_uni_prime_anisotropy_energy_density(self.magnet)
+        assert max_relative_error(result, wanted) < RTOL
+
+    def test_anisotropy_energy(self):
+        result = self.magnet.anisotropy_energy()
+        wanted = compute_uni_prime_anisotropy_energy(self.magnet)
+        relative_error = (result - wanted) / wanted
+        assert relative_error < RTOL
+
+
+class TestCombinedUniaxialAnisotropy:
+    """Test that both uniaxial anisotropies combine correctly."""
+
+    def setup_class(self):
+        self.world = World(cellsize=(1e-9, 2e-9, 4e-9))
+        self.magnet = Ferromagnet(self.world, Grid((16, 32, 4)))
+        self.magnet.msat = 800e3
+        self.magnet.ku1 = 4.1e6
+        self.magnet.ku2 = 2.1e6
+        self.magnet.anisU = (0.3, 0.4, 1.0)
+        self.magnet.ku1_prime = 3.5e6
+        self.magnet.anisU_prime = (0.6, 0.7, 0.2)
+
+    def test_combined_anisotropy_field(self):
+        result = (self.magnet.anisotropy_field(),)
+        wanted = (compute_uniaxial_anisotropy_field(self.magnet)
+                  + compute_uni_prime_anisotropy_field(self.magnet))
+        assert max_relative_error(result, wanted) < RTOL
+
+    def test_combined_anisotropy_energy_density(self):
+        result = (self.magnet.anisotropy_energy_density(),)
+        wanted = (compute_uniaxial_anisotropy_energy_density(self.magnet)
+                  + compute_uni_prime_anisotropy_energy_density(self.magnet))
+        assert max_relative_error(result, wanted) < RTOL
+
+    def test_combined_anisotropy_energy(self):
+        result = self.magnet.anisotropy_energy()
+        wanted = (compute_uniaxial_anisotropy_energy(self.magnet)
+                  + compute_uni_prime_anisotropy_energy(self.magnet))
+        relative_error = (result - wanted) / wanted
+        assert relative_error < RTOL
+
+
 # --- Cubic Anisotropy ---
 
 def compute_cubic_anisotropy_field(magnet):

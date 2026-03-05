@@ -8,8 +8,12 @@
 #include <stdio.h>
 
 bool unianisotropyAssuredZero(const Ferromagnet* magnet) {
-  return (magnet->ku1.assuredZero() && magnet->ku2.assuredZero())
-       || magnet->anisU.assuredZero() || magnet->msat.assuredZero();
+  if (magnet->msat.assuredZero()) return true;
+  bool primaryZero = (magnet->ku1.assuredZero() && magnet->ku2.assuredZero())
+                   || magnet->anisU.assuredZero() || magnet->msat.assuredZero();
+  bool primeZero = magnet->ku1_prime.assuredZero()
+                 || magnet->anisU_prime.assuredZero() || magnet->msat.assuredZero();
+  return primaryZero && primeZero;
 }
 
 bool cubicanisotropyAssuredZero(const Ferromagnet* magnet) {
@@ -28,6 +32,8 @@ __global__ void k_unianisotropyField(CuField hField,
                                   const CuVectorParameter anisU,
                                   const CuParameter FM_Ku1,
                                   const CuParameter FM_Ku2,
+                                  const CuVectorParameter anisU_prime,
+                                  const CuParameter FM_Ku1_prime,
                                   const CuParameter msat) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -43,15 +49,27 @@ __global__ void k_unianisotropyField(CuField hField,
       return;
     }
 
-  real3 u = normalized(anisU.vectorAt(idx));
   real3 m = mField.vectorAt(idx);
-  real k1 = FM_Ku1.valueAt(idx);
-  real k2 = FM_Ku2.valueAt(idx);
   real Ms = msat.valueAt(idx);
+  real3 h = real3{0, 0, 0};
 
-  real mu = dot(m, u);
+  real3 u_vec = anisU.vectorAt(idx);
+  if (dot(u_vec, u_vec) > 0) {
+    real3 u = normalized(u_vec);
+    real k1 = FM_Ku1.valueAt(idx);
+    real k2 = FM_Ku2.valueAt(idx);
+    real mu = dot(m, u);
+    h += (2 * k1 * mu + 4 * k2 * mu * mu * mu) * u / Ms;
+  }
 
-  real3 h = (2 * k1 * mu + 4 * k2 * mu * mu * mu) * u / Ms;
+  real3 up_vec = anisU_prime.vectorAt(idx);
+  if (dot(up_vec, up_vec) > 0) {
+    real3 up = normalized(up_vec);
+    real k1p = FM_Ku1_prime.valueAt(idx);
+    real mup = dot(m, up);
+    h += (2 * k1p * mup) * up / Ms;
+  }
+
   hField.setVectorInCell(idx, h);
 }
 
@@ -122,11 +140,9 @@ Field evalAnisotropyField(const Ferromagnet* magnet) {
   int ncells = magnet->grid().ncells();
 
   if (!unianisotropyAssuredZero(magnet)) {
-    auto anisU = magnet->anisU.cu();
-    auto ku1 = magnet->ku1.cu();
-    auto ku2 = magnet->ku2.cu();
     cudaLaunch(ncells, k_unianisotropyField, h, m,
-               anisU, ku1, ku2, msat);
+               magnet->anisU.cu(), magnet->ku1.cu(), magnet->ku2.cu(),
+               magnet->anisU_prime.cu(), magnet->ku1_prime.cu(), msat);
   }
   else if(!cubicanisotropyAssuredZero(magnet)) {
     auto anisC1 = magnet->anisC1.cu();
@@ -145,6 +161,8 @@ __global__ void k_unianisotropyEnergyDensity(CuField edens,
                                           const CuVectorParameter anisU,
                                           const CuParameter Ku1,
                                           const CuParameter Ku2,
+                                          const CuVectorParameter anisU_prime,
+                                          const CuParameter Ku1_prime,
                                           const CuParameter msat) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -161,16 +179,27 @@ __global__ void k_unianisotropyEnergyDensity(CuField edens,
     return;
   }
 
-  real3 u = normalized(anisU.vectorAt(idx));
   real3 m = mField.vectorAt(idx);
-  real k1 = Ku1.valueAt(idx);
-  real k2 = Ku2.valueAt(idx);
-
-  real mu = dot(m, u);
-
   real e = 0.0;
-  e -= k1 * mu * mu;
-  e -= k2 * mu * mu * mu * mu;
+
+  real3 u_vec = anisU.vectorAt(idx);
+  if (dot(u_vec, u_vec) > 0) {
+    real3 u = normalized(u_vec);
+    real k1 = Ku1.valueAt(idx);
+    real k2 = Ku2.valueAt(idx);
+    real mu = dot(m, u);
+    e -= k1 * mu * mu;
+    e -= k2 * mu * mu * mu * mu;
+  }
+
+  real3 up_vec = anisU_prime.vectorAt(idx);
+  if (dot(up_vec, up_vec) > 0) {
+    real3 up = normalized(up_vec);
+    real k1p = Ku1_prime.valueAt(idx);
+    real mup = dot(m, up);
+    e -= k1p * mup * mup;
+  }
+
   edens.setValueInCell(idx, 0, e);
 }
 
@@ -237,11 +266,9 @@ Field evalAnisotropyEnergyDensity(const Ferromagnet* magnet) {
   int ncells = magnet->grid().ncells();
 
   if(!unianisotropyAssuredZero(magnet)) {
-    auto anisU = magnet->anisU.cu();
-    auto ku1 = magnet->ku1.cu();
-    auto ku2 = magnet->ku2.cu();
     cudaLaunch(ncells, k_unianisotropyEnergyDensity, e, m,
-               anisU, ku1, ku2, msat);
+               magnet->anisU.cu(), magnet->ku1.cu(), magnet->ku2.cu(),
+               magnet->anisU_prime.cu(), magnet->ku1_prime.cu(), msat);
   }
   else if(!cubicanisotropyAssuredZero(magnet)) {
     auto anisC1 = magnet->anisC1.cu();
@@ -256,7 +283,7 @@ Field evalAnisotropyEnergyDensity(const Ferromagnet* magnet) {
 }
 
 real evalAnisotropyEnergy(const Ferromagnet* magnet) {
-  if (unianisotropyAssuredZero(magnet) && cubicanisotropyAssuredZero(magnet))
+  if (anisotropyAssuredZero(magnet))
     return 0;
 
   real edens = anisotropyEnergyDensityQuantity(magnet).average()[0];

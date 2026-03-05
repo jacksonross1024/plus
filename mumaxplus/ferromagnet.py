@@ -351,6 +351,37 @@ class Ferromagnet(Magnet):
         self.anisU.set(value)
 
     @property
+    def ku1_prime(self) -> Parameter:
+        """Second uniaxial anisotropy constant Ku1' (J/m³).
+
+        This is a second-order uniaxial anisotropy along a separate easy axis
+        defined by `anisU_prime`, independent of the primary uniaxial anisotropy.
+        
+        See Also
+        --------
+        anisU_prime, ku1, ku2, anisU
+        """
+        return Parameter(self._impl.ku1_prime)
+
+    @ku1_prime.setter
+    def ku1_prime(self, value):
+        self.ku1_prime.set(value)
+
+    @property
+    def anisU_prime(self) -> Parameter:
+        """Second uniaxial anisotropy direction (easy axis for ku1_prime).
+        
+        See Also
+        --------
+        ku1_prime, ku1, ku2, anisU
+        """
+        return Parameter(self._impl.anisU_prime)
+
+    @anisU_prime.setter
+    def anisU_prime(self, value):
+        self.anisU_prime.set(value)
+
+    @property
     def kc1(self) -> Parameter:
         """Cubic anisotropy parameter Kc1 (J/m³).
         
