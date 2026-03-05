@@ -82,8 +82,8 @@ To see which CUDA Toolkit works for your GPU's Compute Capability, check [this S
 First, clone the mumax⁺ Git repository. The `--recursive` flag is used in the following command to get the pybind11 submodule, which is needed to build mumax⁺.
 
 ```bash
-git clone --recursive https://github.com/jacksonross1024/plus.git
-cd mumaxplus
+git clone --recursive https://github.com/jacksonross1024/plus.git mumaxross
+cd mumaxross
 ```
 
 We recommend to install mumax⁺ in a clean conda environment as follows. You could also skip this step and use your own conda environment instead if preferred.
