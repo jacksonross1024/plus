@@ -21,6 +21,10 @@ void LinSolver::setSystem(LinearSystem newSystem) {
 }
 
 void LinSolver::setMethod(Method method) {
+  if (stepper_ && stepper_->method() == method) {
+    stepper_->restart();
+    return;
+  }
   stepper_ = Stepper::create(this, method);
   stepper_->restart();
 }

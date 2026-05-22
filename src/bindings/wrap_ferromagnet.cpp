@@ -35,6 +35,8 @@ void wrap_ferromagnet(py::module& m) {
       .def_readwrite("enable_openbc", &Ferromagnet::enableOpenBC)
       .def_readwrite("enable_zhang_li_torque", &Ferromagnet::enableZhangLiTorque)
       .def_readwrite("enable_slonczewski_torque", &Ferromagnet::enableSlonczewskiTorque)
+      .def_readwrite("enable_combined_spin_transfer_torque",
+                     &Ferromagnet::enableCombinedSpinTransferTorque)
       .def_readwrite("bias_magnetic_field", &Ferromagnet::biasMagneticField,
                      "uniform external magnetic field")
       .def_readwrite("fixed_layer_on_top", &Ferromagnet::fixedLayerOnTop)
@@ -60,8 +62,12 @@ void wrap_ferromagnet(py::module& m) {
       .def_readonly("epsilon_prime", &Ferromagnet::epsilonPrime)
       .def_readonly("fixed_layer", &Ferromagnet::fixedLayer)
       .def_readonly("xi", &Ferromagnet::xi)
+      .def_readonly("xi_zl", &Ferromagnet::xi_zl)
       .def_readonly("pol", &Ferromagnet::pol)
+      .def_readonly("pol_zl", &Ferromagnet::pol_zl)
       .def_readonly("jcur", &Ferromagnet::jcur)
+      .def_readonly("jcur_stt", &Ferromagnet::jcur_stt)
+      .def_readonly("jcur_zl", &Ferromagnet::jcur_zl)
       .def_readonly("temperature", &Ferromagnet::temperature)
       .def_readonly("dmi_tensor", &Ferromagnet::dmiTensor)
       .def_readonly("applied_potential", &Ferromagnet::appliedPotential)

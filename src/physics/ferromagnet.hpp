@@ -56,12 +56,18 @@ class Ferromagnet : public Magnet {
   bool enableOpenBC;
   bool enableZhangLiTorque;
   bool enableSlonczewskiTorque;
+  /** When true, Zhang-Li and Slonczewski torques are evaluated additively. */
+  bool enableCombinedSpinTransferTorque;
   bool fixedLayerOnTop;
   VectorParameter anisU;
   VectorParameter anisU_prime;
   VectorParameter anisC1;
   VectorParameter anisC2;
   VectorParameter jcur;
+  /** Slonczewski current density (combined mode). */
+  VectorParameter jcur_stt;
+  /** Zhang-Li current density (combined mode). */
+  VectorParameter jcur_zl;
   VectorParameter fixedLayer;
   /** Uniform bias magnetic field which will affect a ferromagnet.
    * Measured in Teslas.
@@ -84,7 +90,11 @@ class Ferromagnet : public Magnet {
   Parameter freeLayerThickness;
   Parameter epsilonPrime;
   Parameter xi;
+  /** Zhang-Li non-adiabaticity override (combined mode; falls back to xi). */
+  Parameter xi_zl;
   Parameter pol;
+  /** Zhang-Li polarization override (combined mode; falls back to pol). */
+  Parameter pol_zl;
   Parameter appliedPotential;
   Parameter conductivity;
   Parameter amrRatio;

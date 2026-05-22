@@ -115,9 +115,44 @@ __global__ void k_afmExchangeFieldNN(CuField hField,
 
     if(!hField.cellInGeometry(coo_) && openBC)
       continue;
-    
+
+    const real delta = dot(rel_coo, system.cellsize);
+
+    // Neighbor outside magnet grid (e.g. z past top layer when mastergrid nz==0).
+    // Do not use coord2index(coo_) or field reads at idx_; use Neumann path with ann
+    // for missing neighbor stiffness (mirrors inner branch below).
+    if (!grid.cellInGrid(coo_)) {
+      if (openBC)
+        continue;
+      real3 m2_;
+      real ann_;
+      int3 normal = rel_coo * rel_coo;
+      real inter = 0;
+      real scale = 1;
+      unsigned int ridx = system.getRegionIdx(idx);
+      real3 Gamma2 = getGamma(dmiTensor, idx, normal, m2);
+      real3 d_m1{0, 0, 0};
+      int3 coo__ = mastergrid.wrap(coo - rel_coo);
+      if (!hField.cellInGeometry(coo__))
+        continue;
+      int idx__ = grid.coord2index(coo__);
+      unsigned int ridx__ = system.getRegionIdx(idx__);
+      if (hField.cellInGeometry(coo__)) {
+        real3 m1__ = m1Field.vectorAt(coo__);
+        real3 m1 = m1Field.vectorAt(idx);
+        d_m1 = (m1 - m1__) / delta;
+      }
+      real Aex_nn = getExchangeStiffness(interExch.valueBetween(ridx, ridx__),
+                                         scaleExch.valueBetween(ridx, ridx__),
+                                         ann, ann);
+      m2_ = m2 + (Aex_nn * cross(cross(d_m1, m2), m2) + Gamma2) * delta / (2 * a);
+      ann_ = ann;
+      real Aex = getExchangeStiffness(inter, scale, ann, ann_);
+      h += Aex * (m2_ - m2) / (delta * delta);
+      continue;
+    }
+
     const int idx_ = grid.coord2index(coo_);
-    real delta = dot(rel_coo, system.cellsize);
 
     if(msat2.valueAt(idx_) != 0 || !openBC) {
       real3 m2_;

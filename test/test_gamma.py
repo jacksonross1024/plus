@@ -74,3 +74,24 @@ def test_gyromagnetic_ratio_Slonczewski():
 
     err = max_semirelative_error(t2 / 2, t1)
     assert err < 1e-7
+
+
+def test_gyromagnetic_ratio_ZhangLi_invariant():
+    """Zhang-Li STT (rad/s) is independent of gamma, matching mumax3 STTorque/γ₀."""
+
+    world = World((1e-9, 1e-9, 1e-9))
+    magnet = Ferromagnet(world, Grid((10, 10, 1)))
+
+    magnet.enable_slonczewski_torque = False
+    magnet.msat = 800e3
+    magnet.alpha = 0.1
+    magnet.xi = 0.2
+    magnet.pol = 1.0
+    magnet.jcur = (1e12, 0, 0)
+
+    t1 = magnet.spin_transfer_torque()
+    magnet.gamma = magnet.gamma() * 2
+    t2 = magnet.spin_transfer_torque()
+
+    err = max_semirelative_error(t2, t1)
+    assert err < 1e-7

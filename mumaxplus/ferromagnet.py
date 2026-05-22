@@ -131,6 +131,26 @@ class Ferromagnet(Magnet):
         self._impl.enable_slonczewski_torque = value
 
     @property
+    def enable_combined_spin_transfer_torque(self) -> bool:
+        """Enable additive Zhang-Li and Slonczewski spin-transfer torque.
+
+        When True, both torque models may be active at once. Use ``jcur`` for a
+        shared current density, or set both ``jcur_stt`` and ``jcur_zl`` for
+        separate currents. Setting only one of the split currents raises an error.
+
+        Default = False.
+
+        See Also
+        --------
+        jcur, jcur_stt, jcur_zl, enable_zhang_li_torque, enable_slonczewski_torque
+        """
+        return self._impl.enable_combined_spin_transfer_torque
+
+    @enable_combined_spin_transfer_torque.setter
+    def enable_combined_spin_transfer_torque(self, value):
+        self._impl.enable_combined_spin_transfer_torque = value
+
+    @property
     def bias_magnetic_field(self) -> Parameter:
         """Uniform bias magnetic field which will affect a ferromagnet.
         
@@ -532,7 +552,7 @@ class Ferromagnet(Magnet):
         
         See Also
         --------
-        jcur, pol
+        jcur, pol, xi_zl
         """
         return Parameter(self._impl.xi)
 
@@ -541,12 +561,28 @@ class Ferromagnet(Magnet):
         self.xi.set(value)
 
     @property
+    def xi_zl(self) -> Parameter:
+        """Zhang-Li non-adiabaticity override in combined STT mode.
+
+        When zero (default), ``xi`` is used.
+
+        See Also
+        --------
+        xi, enable_combined_spin_transfer_torque, jcur_zl, pol_zl
+        """
+        return Parameter(self._impl.xi_zl)
+
+    @xi_zl.setter
+    def xi_zl(self, value):
+        self.xi_zl.set(value)
+
+    @property
     def pol(self) -> Parameter:
         """Electrical current polarization.
         
         See Also
         --------
-        epsilon_prime, jcur, Lambda, fixed_layer, fixed_layer_on_top, free_layer_thickness, xi
+        epsilon_prime, jcur, Lambda, fixed_layer, fixed_layer_on_top, free_layer_thickness, xi, pol_zl
         """
         return Parameter(self._impl.pol)
 
@@ -555,11 +591,31 @@ class Ferromagnet(Magnet):
         self.pol.set(value)
 
     @property
-    def jcur(self) -> Parameter:
-        """Electrical current density (A/m²).
+    def pol_zl(self) -> Parameter:
+        """Zhang-Li polarization override in combined STT mode.
+
+        When zero (default), ``pol`` is used.
 
         See Also
         --------
+        pol, enable_combined_spin_transfer_torque, jcur_zl, xi_zl
+        """
+        return Parameter(self._impl.pol_zl)
+
+    @pol_zl.setter
+    def pol_zl(self, value):
+        self.pol_zl.set(value)
+
+    @property
+    def jcur(self) -> Parameter:
+        """Electrical current density (A/m²).
+
+        In combined STT mode, this shared current is used for both torque models
+        unless ``jcur_stt`` and ``jcur_zl`` are set instead.
+
+        See Also
+        --------
+        jcur_stt, jcur_zl, enable_combined_spin_transfer_torque
         epsilon_prime, Lambda, pol, fixed_layer, fixed_layer_on_top, free_layer_thickness, xi
         """
         return Parameter(self._impl.jcur)
@@ -567,6 +623,38 @@ class Ferromagnet(Magnet):
     @jcur.setter
     def jcur(self, value):
         self.jcur.set(value)
+
+    @property
+    def jcur_stt(self) -> Parameter:
+        """Slonczewski current density (A/m²) in combined STT mode.
+
+        Must be set together with ``jcur_zl`` when not using shared ``jcur``.
+
+        See Also
+        --------
+        jcur_zl, jcur, enable_combined_spin_transfer_torque
+        """
+        return Parameter(self._impl.jcur_stt)
+
+    @jcur_stt.setter
+    def jcur_stt(self, value):
+        self.jcur_stt.set(value)
+
+    @property
+    def jcur_zl(self) -> Parameter:
+        """Zhang-Li current density (A/m²) in combined STT mode.
+
+        Must be set together with ``jcur_stt`` when not using shared ``jcur``.
+
+        See Also
+        --------
+        jcur_stt, jcur, enable_combined_spin_transfer_torque
+        """
+        return Parameter(self._impl.jcur_zl)
+
+    @jcur_zl.setter
+    def jcur_zl(self, value):
+        self.jcur_zl.set(value)
 
     @property
     def temperature(self) -> Parameter:
@@ -743,7 +831,10 @@ class Ferromagnet(Magnet):
 
     @property
     def spin_transfer_torque(self) -> FieldQuantity:
-        """Spin transfer torque exerted on the magnetization (rad/s)."""
+        """Spin-transfer torque contribution to dm/dt (rad/s).
+
+        Matches mumax3 ``STTorque`` multiplied by ``gamma`` (mumax3 stores STTorque/γ₀).
+        """
         return FieldQuantity(_cpp.spin_transfer_torque(self._impl))
     
     @property

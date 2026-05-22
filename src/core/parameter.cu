@@ -34,8 +34,13 @@ void Parameter::set(const Field& values) {
       staticField_ = nullptr;
     }
   }
-  else
-    staticField_ = new Field(values);
+  else {
+    if (staticField_) {
+      *staticField_ = values;
+    } else {
+      staticField_ = new Field(values);
+    }
+  }
 }
 
 void Parameter::setInRegion(const unsigned int region_idx, real value) {
@@ -137,8 +142,13 @@ void VectorParameter::set(const Field& values) {
       staticField_ = nullptr;
     }
   }
-  else
-    staticField_ = new Field(values);
+  else {
+    if (staticField_) {
+      *staticField_ = values;
+    } else {
+      staticField_ = new Field(values);
+    }
+  }
 }
 
 void VectorParameter::setInRegion(const unsigned int region_idx, real3 value) {

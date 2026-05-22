@@ -58,6 +58,7 @@ class LinSolver::Stepper {
  public:
   using Method = LinSolver::Method;
   static std::unique_ptr<Stepper> create(LinSolver* parent, Method);
+  virtual ~Stepper() = default;
 
  public:
   explicit Stepper(LinSolver* parent) : parent_(parent) {}
