@@ -14,3 +14,10 @@ experiment/
 cu*_*.dll
 docs/_build
 !docs/_build/html
+*png
+*npy
+*npz
+*txt
+*csv
+poisson-cpp/
+!mumaxplus/poisson/defaults/*
