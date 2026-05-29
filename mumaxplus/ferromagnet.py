@@ -134,9 +134,9 @@ class Ferromagnet(Magnet):
     def enable_combined_spin_transfer_torque(self) -> bool:
         """Enable additive Zhang-Li and Slonczewski spin-transfer torque.
 
-        When True, both torque models may be active at once. Use ``jcur`` for a
-        shared current density, or set both ``jcur_stt`` and ``jcur_zl`` for
-        separate currents. Setting only one of the split currents raises an error.
+        When True, both torque models may be active at once. Use ``jcur_stt`` for
+        Slonczewski and ``jcur_zl`` for Zhang–Li; ``jcur`` is not used. Either
+        split current may be left unset (zero) if that torque is not needed.
 
         Default = False.
 
@@ -610,8 +610,8 @@ class Ferromagnet(Magnet):
     def jcur(self) -> Parameter:
         """Electrical current density (A/m²).
 
-        In combined STT mode, this shared current is used for both torque models
-        unless ``jcur_stt`` and ``jcur_zl`` are set instead.
+        In combined STT mode, use ``jcur_stt`` and ``jcur_zl`` instead; ``jcur`` is
+        ignored and must remain zero.
 
         See Also
         --------
@@ -628,7 +628,7 @@ class Ferromagnet(Magnet):
     def jcur_stt(self) -> Parameter:
         """Slonczewski current density (A/m²) in combined STT mode.
 
-        Must be set together with ``jcur_zl`` when not using shared ``jcur``.
+        Used for Slonczewski torque when combined STT is enabled. May be zero.
 
         See Also
         --------
@@ -644,7 +644,7 @@ class Ferromagnet(Magnet):
     def jcur_zl(self) -> Parameter:
         """Zhang-Li current density (A/m²) in combined STT mode.
 
-        Must be set together with ``jcur_stt`` when not using shared ``jcur``.
+        Used for Zhang–Li torque when combined STT is enabled. May be zero.
 
         See Also
         --------

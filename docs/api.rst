@@ -31,4 +31,5 @@ API
 .. toctree::
    :maxdepth: 1
 
+   poisson
    util

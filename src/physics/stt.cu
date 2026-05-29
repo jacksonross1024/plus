@@ -10,14 +10,6 @@
 
 namespace {
 
-bool jcurSttConfigured(const Ferromagnet* magnet) {
-  return !magnet->jcur_stt.assuredZero();
-}
-
-bool jcurZlConfigured(const Ferromagnet* magnet) {
-  return !magnet->jcur_zl.assuredZero();
-}
-
 bool jcurLegacyConfigured(const Ferromagnet* magnet) {
   return !magnet->jcur.assuredZero();
 }
@@ -35,20 +27,10 @@ void validateCombinedSttConfig(const Ferromagnet* magnet) {
     return;
   }
 
-  const bool splitStt = jcurSttConfigured(magnet);
-  const bool splitZl = jcurZlConfigured(magnet);
-  const bool legacy = jcurLegacyConfigured(magnet);
-
-  if (legacy && (splitStt || splitZl)) {
+  if (jcurLegacyConfigured(magnet)) {
     throw std::invalid_argument(
-        "Combined spin-transfer torque: cannot use jcur together with "
-        "jcur_stt and/or jcur_zl.");
-  }
-
-  if (splitStt != splitZl) {
-    throw std::invalid_argument(
-        "Combined spin-transfer torque: jcur_stt and jcur_zl must both be "
-        "set when using split current densities.");
+        "Combined spin-transfer torque: use jcur_stt and jcur_zl instead of "
+        "jcur.");
   }
 }
 
@@ -58,18 +40,12 @@ struct ResolvedSttCurrents {
 };
 
 ResolvedSttCurrents resolveSttCurrents(const Ferromagnet* magnet) {
-  validateCombinedSttConfig(magnet);
-
-  ResolvedSttCurrents resolved{&magnet->jcur, &magnet->jcur};
-
   if (magnet->enableCombinedSpinTransferTorque) {
-    if (jcurSttConfigured(magnet) && jcurZlConfigured(magnet)) {
-      resolved.slonczewski = &magnet->jcur_stt;
-      resolved.zhangLi = &magnet->jcur_zl;
-    }
+    validateCombinedSttConfig(magnet);
+    return {&magnet->jcur_zl, &magnet->jcur_stt};
   }
 
-  return resolved;
+  return {&magnet->jcur, &magnet->jcur};
 }
 
 bool zhangLiSTTAssuredZero(const Ferromagnet* magnet,

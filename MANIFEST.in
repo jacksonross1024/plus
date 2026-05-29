@@ -3,6 +3,7 @@ include CMakeLists.txt
 recursive-include examples *.py *ipynb
 
 graft src
+recursive-include mumaxplus/poisson/defaults *.txt *.npy
 
 graft docs
 prune docs/_api

@@ -1,0 +1,13 @@
+format_version=1
+nx=512
+ny=512
+nz=10
+cx=1.95312499506883341e-09
+cy=1.95312499506883341e-09
+cz=4.99999996961264515e-09
+first_r2_layer=2
+theta_sh=2.00000000000000011e-01
+decay_length=8.00000000000000050e-09
+region_file=FGaT-amr-sine-poisson-region.npy
+contact_id_file=FGaT-amr-sine-poisson-contact-id.npy
+sigma_file=FGaT-amr-sine-poisson-sigma.npy

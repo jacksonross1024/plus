@@ -57,6 +57,7 @@ from .traction import BoundaryTraction
 from .variable import Variable
 from .world import World
 from . import util
+from . import poisson
 
 FP_PRECISION = {1: "SINGLE", 2: "DOUBLE"}.get(_cpp.FP_PRECISION, "UNKNOWN") # Use _cpp value, as that is certainly the correct one
 
@@ -78,6 +79,7 @@ __all__ = [
     "Variable",
     "World",
     "PoissonSystem",
+    "poisson",
     "util",
     "FP_PRECISION"
 ]

@@ -27,12 +27,13 @@ pybind11_add_module(${MUMAX_MODULE_NAME}
     wrap_variable.cpp
     wrap_world.cpp
     wrap_poissonsystem.cpp
+    wrap_poisson_cuda.cpp
     wrap_linsolver.cpp
     wrap_voronoi.cpp
     wrap_traction.cpp
 )
 
 target_include_directories(${MUMAX_MODULE_NAME} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-target_link_libraries(${MUMAX_MODULE_NAME} PRIVATE core physics)
+target_link_libraries(${MUMAX_MODULE_NAME} PRIVATE core physics poisson_native)
 set_target_properties(${MUMAX_MODULE_NAME} PROPERTIES OUTPUT_NAME "${MUMAX_MODULE_NAME}")
 target_compile_definitions(${MUMAX_MODULE_NAME} PRIVATE MUMAX_MODULE_NAME=${MUMAX_MODULE_NAME})

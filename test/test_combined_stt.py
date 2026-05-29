@@ -73,42 +73,32 @@ def test_combined_equals_sum_of_models(combined_magnet):
     assert err < 1e-6 * scale
 
 
-def test_combined_shared_jcur_fallback():
-    """Shared jcur drives both models when split currents are not set."""
+def test_combined_rejects_jcur_when_enabled():
     magnet = Ferromagnet(World((5e-9, 5e-9, 2e-9)), Grid((12, 12, 2)))
     _configure_stt_magnet(magnet)
     magnet.enable_combined_spin_transfer_torque = True
-    magnet.enable_zhang_li_torque = True
-    magnet.enable_slonczewski_torque = True
-    magnet.jcur_stt = (0.0, 0.0, 0.0)
-    magnet.jcur_zl = (0.0, 0.0, 0.0)
     magnet.jcur = (2e11, 0.0, -3e11)
-
-    t_combined = magnet.spin_transfer_torque.eval()
-
-    magnet.enable_combined_spin_transfer_torque = False
-    magnet.enable_slonczewski_torque = False
-    magnet.enable_zhang_li_torque = True
-    t_zl = magnet.spin_transfer_torque.eval()
-
-    magnet.enable_zhang_li_torque = False
-    magnet.enable_slonczewski_torque = True
-    t_stt = magnet.spin_transfer_torque.eval()
-
-    err = np.max(np.linalg.norm(t_combined - (t_zl + t_stt), axis=0))
-    scale = np.max(np.linalg.norm(t_combined, axis=0)) + 1e-30
-    assert err < 1e-6 * scale
-
-
-def test_combined_rejects_partial_split_current():
-    magnet = Ferromagnet(World((5e-9, 5e-9, 2e-9)), Grid((8, 8, 2)))
-    _configure_stt_magnet(magnet)
-    magnet.enable_combined_spin_transfer_torque = True
-    magnet.jcur_stt = (1e11, 0.0, 0.0)
-    magnet.jcur_zl = (0.0, 0.0, 0.0)
 
     with pytest.raises(Exception):
         magnet.spin_transfer_torque.eval()
+
+
+def test_combined_allows_partial_split_current():
+    """Only Slonczewski or only Zhang–Li may be driven in combined mode."""
+    magnet = Ferromagnet(World((5e-9, 5e-9, 2e-9)), Grid((8, 8, 2)))
+    _configure_stt_magnet(magnet)
+    magnet.enable_combined_spin_transfer_torque = True
+    magnet.jcur_stt = (0.0, 0.0, -4e11)
+    magnet.jcur_zl = (0.0, 0.0, 0.0)
+
+    t_stt_only = magnet.spin_transfer_torque.eval()
+
+    magnet.jcur_stt = (0.0, 0.0, 0.0)
+    magnet.jcur_zl = (6e11, 0.0, 0.0)
+    t_zl_only = magnet.spin_transfer_torque.eval()
+
+    assert np.max(np.linalg.norm(t_stt_only, axis=0)) > 0
+    assert np.max(np.linalg.norm(t_zl_only, axis=0)) > 0
 
 
 def test_combined_rejects_mixed_jcur_and_split():

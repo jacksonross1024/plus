@@ -24,6 +24,7 @@ add_definitions(-DMUMAX_MODULE_NAME=${MUMAX_MODULE_NAME})
 
 add_definitions(-D_USE_MATH_DEFINES) # Needed for cmath constants on Windows
 
+add_subdirectory(src/poisson)
 add_subdirectory(src/bindings)
 add_subdirectory(src/cmd)
 add_subdirectory(src/core)
