@@ -16,10 +16,7 @@ def main() -> None:
     import mumaxplus.poisson as poisson
 
     potentials = np.full((args.nt, 3), 1e-3, dtype=np.float64)
-    solver = poisson.CudaPoissonSolver(
-        contact_potentials=potentials,
-        fm_export_layers=0,
-    )
+    solver = poisson.CudaPoissonSolver(contact_potentials=potentials)
 
     print("Poisson world shape:", solver.world_shape)
     print("Poisson buffer shape:", solver.internal_output_shape)

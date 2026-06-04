@@ -20,7 +20,7 @@ class _FakeImpl:
         self.buffer_shape = buffer_shape
         self.output_shape = (3, nz, ny, nx)
         self.world_shape = (3, 4, 5)
-        self.cellsize = (1.0, 2.0, 3.0)
+        self.cellsize = (1.0, 2.0, 5e-9)
         self.theta_sh = 0.2
         self.decay_length = 8e-9
         self.unknown_count = 17
@@ -37,7 +37,11 @@ class _FakeImpl:
         step = self.current_step
         skipped = bool(np.max(np.abs(self._potentials[step])) < 1e-5)
         value = 0.0 if skipped else float(step + 1)
-        frame = np.full(self.output_shape, value, dtype=np.float32)  # (3, nz, ny, nx)
+        nz, ny, nx = self.buffer_shape[:3]
+        frame = np.empty((3, nz, ny, nx), dtype=np.float32)
+        for k in range(nz):
+            layer_value = 0.0 if skipped else float(value + k)
+            frame[:, k, ...] = layer_value
         self.current_step += 1
         return {
             "jmod": frame,
@@ -152,7 +156,7 @@ def test_manifest_solver_iterate_and_compatibility(fake_raw_solver):
     potentials = np.array([[0.0, 0.0, 0.0], [1e-3, 0.0, 0.0]], dtype=np.float64)
     solver = poisson.CudaPoissonSolver(contact_potentials=potentials)
 
-    assert solver.check_compatible((2, 4, 5), cellsize=(1.0, 2.0, 3.0))["n_steps"] == 2
+    assert solver.check_compatible((2, 4, 5), cellsize=(1.0, 2.0, 5e-9))["n_steps"] == 2
     assert solver.current_step == 0
 
     first = solver.iterate()
@@ -163,49 +167,66 @@ def test_manifest_solver_iterate_and_compatibility(fake_raw_solver):
 
     second = solver.iterate()
     assert not second.stats.skipped
-    np.testing.assert_allclose(second.jcur, 2.0)
+    np.testing.assert_allclose(second.jcur[:, 0, ...], 2.0)
+    np.testing.assert_allclose(second.jcur[:, 1, ...], 3.0)
     assert solver.exhausted
 
 
-def test_check_compatible_accepts_field_shape(fake_raw_solver):
+def test_check_compatible_rejects_nz_mismatch(fake_raw_solver):
     solver = poisson.CudaPoissonSolver(contact_potentials=np.zeros((1, 3)))
-    assert solver.check_compatible((3, 2, 4, 5))["shape"] == (3, 2, 4, 5)
+    with pytest.raises(ValueError, match="Poisson export shape"):
+        solver.check_compatible((10, 4, 5))
 
 
-def test_check_compatible_rejects_mismatch(fake_raw_solver):
+def test_check_compatible_rejects_xy_mismatch(fake_raw_solver):
     solver = poisson.CudaPoissonSolver(contact_potentials=np.zeros((1, 3)))
-    with pytest.raises(ValueError, match="only has"):
-        solver.check_compatible((3, 4, 5))
     with pytest.raises(ValueError, match="incompatible"):
         solver.check_compatible((2, 4, 4))
-    assert solver.current_step == 0
 
 
-def test_fm_export_single_layer(fake_raw_solver):
+def test_parse_fm_nz_spec():
+    assert poisson.parse_fm_nz_spec("0", 4, 1) == (0,)
+    assert poisson.parse_fm_nz_spec("1", 4, 10) == (1,)
+    assert poisson.parse_fm_nz_spec("0:2", 4, 2) == (0, 1)
+    with pytest.raises(ValueError, match="mumax FM has 1"):
+        poisson.parse_fm_nz_spec("0:2", 4, 1)
+
+
+def test_map_layer_broadcast(fake_raw_solver):
     potentials = np.array([[1e-3, 0.0, 0.0]], dtype=np.float64)
     solver = poisson.CudaPoissonSolver(
         contact_potentials=potentials,
-        fm_export_layers=0,
+        fm_nz="0",
+        fm_mumax_nz=10,
     )
-    assert solver.output_shape == (3, 1, 4, 5)
-    assert solver.fm_layer_count == 2
-    assert solver.fm_export_layers == (0,)
+    frame = solver.iterate()
+    assert frame.jmod.shape == (3, 10, 4, 5)
+    np.testing.assert_allclose(frame.jmod[:, 0, ...], frame.jmod[:, 5, ...])
+    np.testing.assert_allclose(frame.jmod, 1.0)
 
+
+def test_map_layer_range(fake_raw_solver):
+    potentials = np.array([[1e-3, 0.0, 0.0]], dtype=np.float64)
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=potentials,
+        fm_nz="0:2",
+        fm_mumax_nz=2,
+    )
+    frame = solver.iterate()
+    np.testing.assert_allclose(frame.jmod[:, 0, ...], 1.0)
+    np.testing.assert_allclose(frame.jmod[:, 1, ...], 2.0)
+
+
+def test_map_height_resample(fake_raw_solver):
+    potentials = np.array([[1e-3, 0.0, 0.0]], dtype=np.float64)
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=potentials,
+        fm_height=10e-9,
+        fm_mumax_nz=1,
+    )
     frame = solver.iterate()
     assert frame.jmod.shape == (3, 1, 4, 5)
-    layers = list(frame.iter_fm_layers())
-    assert len(layers) == 1
-    assert layers[0][0].shape == (3, 4, 5)
-
-
-def test_check_compatible_rejects_too_many_fm_layers(fake_raw_solver):
-    solver = poisson.CudaPoissonSolver(
-        contact_potentials=np.zeros((1, 3)),
-        fm_export_layers=(0, 1),
-    )
-    solver.check_compatible((2, 4, 5))
-    with pytest.raises(ValueError, match="only has"):
-        solver.check_compatible((3, 4, 5))
+    np.testing.assert_allclose(frame.jmod[:, 0, ...], 1.5)
 
 
 def test_parse_fm_export_layers():
@@ -230,7 +251,7 @@ def test_world_spec_uses_in_memory_arrays(fake_raw_solver):
         sigma=sigma,
     )
     solver = poisson.CudaPoissonSolver(
-        world=spec, contact_potentials=np.zeros((1, 3)), fm_export_layers=None
+        world=spec, contact_potentials=np.zeros((1, 3))
     )
     assert solver.output_shape == (3, 1, 3, 4)
     assert solver.fm_layer_count == 1

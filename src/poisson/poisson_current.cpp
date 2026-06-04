@@ -299,6 +299,21 @@ void log_poisson_phi_j_region_stats(const PoissonWorld& world,
   print_acc("FM iz=first_r2 (interface)", fm_interface);
 }
 
+double fm_injection_decay_factor(const int fm_layer_index,
+                                 const double cz,
+                                 const double decay_length) {
+  if (!(decay_length > 0.0) || !(cz > 0.0)) {
+    return 1.0;
+  }
+  const double z_bottom = static_cast<double>(fm_layer_index) * cz;
+  const double z_mid = z_bottom + 0.5 * cz;
+  const double z_top = z_bottom + cz;
+  const double inv_lambda = 1.0 / decay_length;
+  return (std::exp(-z_bottom * inv_lambda) + std::exp(-z_mid * inv_lambda) +
+          std::exp(-z_top * inv_lambda)) /
+         3.0;
+}
+
 void apply_jmod_postprocess(const PoissonWorld& world,
                             double decay_length,
                             std::vector<float>& j_frame,
@@ -348,8 +363,9 @@ void apply_jmod_postprocess(const PoissonWorld& world,
   }
 
   for (int iz = world.first_r2_layer(); iz < nz; ++iz) {
+    const int fm_layer = iz - world.first_r2_layer();
     const float factor = static_cast<float>(
-        std::exp(-static_cast<double>(iz - world.first_r2_layer()) * world.cz() / decay_length));
+        fm_injection_decay_factor(fm_layer, world.cz(), decay_length));
     for (int iy = 0; iy < ny; ++iy) {
       for (int ix = 0; ix < nx; ++ix) {
         const int cell = world.flat_index(iz, iy, ix);

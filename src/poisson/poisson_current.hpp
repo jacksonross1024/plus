@@ -49,6 +49,10 @@ void compute_j_raw_from_phi(const PoissonWorld& world,
 /// Zeros non-FM cells in a full-grid **J** frame. Do not call before ``apply_jmod_postprocess``
 /// (that needs Pt-region **J** intact).
 void mask_jcur_fm_layers(const PoissonWorld& world, std::vector<float>& j_raw);
+/// Exponential decay factor for FM layer ``k`` (0 = at Pt interface), using the
+/// arithmetic mean of ``exp(-z/λ)`` at the cell bottom, midpoint, and top.
+double fm_injection_decay_factor(int fm_layer_index, double cz, double decay_length);
+
 void apply_jmod_postprocess(const PoissonWorld& world,
                             double decay_length,
                             std::vector<float>& j_frame,

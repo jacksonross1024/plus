@@ -71,10 +71,9 @@ class PoissonStepStats:
 class PoissonStepResult:
     """Current-density frames returned by one Poisson iteration.
 
-    ``jmod`` and ``jcur`` are shaped ``(3, nz_export, ny, nx)`` (mumax+ vector layout)
-    where ``nz_export`` is the number of FM layers selected at solver construction
-    (see :class:`CudaPoissonSolver` ``fm_export_layers``). FM layer index ``0`` is
-    the layer directly adjacent to the Pt stack (Poisson ``first_r2_layer``).
+    ``jmod`` and ``jcur`` are shaped ``(3, nz_export, ny, nx)`` (mumax+ vector
+    layout), after applying the layer/height export configured on
+    :class:`CudaPoissonSolver`. FM layer index ``0`` is at the Pt interface.
     """
 
     jmod: np.ndarray
@@ -223,6 +222,89 @@ def _fm_slice_z_string(first_r2_layer: int) -> str:
     return f"{int(first_r2_layer)}:"
 
 
+def parse_fm_nz_spec(
+    spec: str,
+    n_poisson_fm: int,
+    fm_mumax_nz: int = 1,
+) -> Tuple[int, ...]:
+    """Parse ``--fm-nz`` layer-export specification.
+
+    Forms
+    -----
+    ``n`` : Poisson layer ``n`` (0 = Pt interface), broadcast to all mumax+ z cells.
+    ``ni:nf`` : Poisson layers ``ni`` … ``nf - 1`` one-to-one with mumax+ z cells.
+    """
+
+    text = str(spec).strip()
+    if not text:
+        raise ValueError("fm-nz must not be empty")
+    if fm_mumax_nz <= 0:
+        raise ValueError("fm_mumax_nz must be > 0")
+    parts = [int(p.strip()) for p in text.split(":")]
+    if len(parts) == 1:
+        layer = parts[0]
+        _validate_poisson_layer(layer, n_poisson_fm)
+        return (layer,)
+    if len(parts) == 2:
+        ni, nf = parts
+        layers = _poisson_layer_range(ni, nf, n_poisson_fm)
+        if len(layers) != fm_mumax_nz:
+            raise ValueError(
+                f"fm-nz range {ni}:{nf} selects {len(layers)} Poisson layer(s), "
+                f"but mumax FM has {fm_mumax_nz} z cell(s)"
+            )
+        return layers
+    raise ValueError("fm-nz must be n or ni:nf (e.g. 0 or 0:1)")
+
+
+def _validate_poisson_layer(layer: int, n_poisson_fm: int) -> None:
+    if layer < 0 or layer >= n_poisson_fm:
+        raise ValueError(
+            f"Poisson FM layer {layer} out of range [0, {n_poisson_fm}) "
+            "(0 = at Pt interface)"
+        )
+
+
+def _poisson_layer_range(ni: int, nf: int, n_poisson_fm: int) -> Tuple[int, ...]:
+    if nf <= ni:
+        raise ValueError(f"Poisson layer range {ni}:{nf} requires nf > ni")
+    if nf > n_poisson_fm:
+        raise ValueError(
+            f"Poisson layer range end nf={nf} exceeds maximum exclusive end "
+            f"{n_poisson_fm} (0 = at Pt interface)"
+        )
+    if ni < 0:
+        raise ValueError("Poisson layer range start must be >= 0")
+    return tuple(range(ni, nf))
+
+
+def _interp_poisson_stack_at_z(
+    stack: np.ndarray,
+    z_m: float,
+    poisson_cz: float,
+) -> np.ndarray:
+    """Linear interpolation of ``(3, nz, ny, nx)`` at height ``z_m`` [m] from Pt interface."""
+
+    arr = _as_mumax_vector_frame(stack)
+    n_poisson = arr.shape[1]
+    if n_poisson <= 0:
+        raise ValueError("Poisson stack has no FM layers")
+    if poisson_cz <= 0.0:
+        raise ValueError("poisson_cz must be > 0")
+
+    pos = float(z_m) / poisson_cz - 0.5
+    if pos <= 0.0:
+        return np.ascontiguousarray(arr[:, 0, ...], dtype=np.float32)
+    if pos >= n_poisson - 1:
+        return np.ascontiguousarray(arr[:, -1, ...], dtype=np.float32)
+
+    lo = int(np.floor(pos))
+    hi = lo + 1
+    weight = np.float32(pos - lo)
+    out = (np.float32(1.0) - weight) * arr[:, lo, ...] + weight * arr[:, hi, ...]
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
 def parse_fm_export_layers(spec: Optional[str]) -> FmExportLayers:
     """Parse ``--fm-export-layers`` style text into :data:`FmExportLayers`.
 
@@ -263,12 +345,12 @@ class CudaPoissonSolver:
 
     The solver loads the full contact-potential series at construction, keeps
     the CUDA PCG warm start alive across ``iterate`` calls, and returns
-    ``float32`` ``jmod`` and ``jcur`` as ``(3, nz, ny, nx)`` for the FM layer(s)
-    you choose to export (same layout as mumax+ vector fields).
+    ``float32`` ``jmod`` and ``jcur`` already mapped to the requested mumax+ FM
+    z grid. Layer export selects Poisson FM layer indices; height export samples
+    the Poisson FM stack at mumax+ cell midpoints in physical z.
 
     All FM-layer postprocessing (raw ``jcur``, Pt injection into ``jmod``, decay)
-    runs on the full Poisson FM stack internally. ``fm_export_layers`` only
-    selects which FM layers are returned to the mumax+ drive grid.
+    runs on the full Poisson FM stack inside the C++ solver.
 
     This class is intentionally separate from ``mumaxplus.PoissonSystem``. Its
     world geometry can come from the packaged default manifest, an explicit
@@ -284,7 +366,9 @@ class CudaPoissonSolver:
         tol: float = 1e-5,
         max_iter: int = 2000,
         skip_threshold: float = 1e-5,
-        fm_export_layers: FmExportLayers = None,
+        fm_nz: Optional[str] = None,
+        fm_height: Optional[float] = None,
+        fm_mumax_nz: int = 1,
         jmod_slice_x: str = "",
         jmod_slice_y: str = "",
         jmod_slice_z: Optional[str] = None,
@@ -297,8 +381,6 @@ class CudaPoissonSolver:
             raise ValueError("provide either world or manifest_path, not both")
 
         first_r2 = _first_r2_for_init(world, manifest_path)
-        if jmod_slice_z is not None and fm_export_layers is not None:
-            raise ValueError("provide either fm_export_layers or jmod_slice_z, not both")
         internal_slice_z = (
             jmod_slice_z if jmod_slice_z is not None else _fm_slice_z_string(first_r2)
         )
@@ -346,9 +428,12 @@ class CudaPoissonSolver:
                 cuda_tol_batch_next,
             )
 
-        n_fm = int(self._impl.buffer_shape[0])
-        self._fm_export_layers = _normalize_fm_export_layers(fm_export_layers, n_fm)
         self._first_r2_layer = int(self._impl.first_r2_layer)
+        self._configure_fm_export(
+            fm_nz=fm_nz,
+            fm_height=fm_height,
+            fm_mumax_nz=fm_mumax_nz,
+        )
 
     @classmethod
     def from_signal_file(
@@ -362,7 +447,9 @@ class CudaPoissonSolver:
         tol: float = 1e-5,
         max_iter: int = 2000,
         skip_threshold: float = 1e-5,
-        fm_export_layers: FmExportLayers = None,
+        fm_nz: Optional[str] = None,
+        fm_height: Optional[float] = None,
+        fm_mumax_nz: int = 1,
         jmod_slice_x: str = "",
         jmod_slice_y: str = "",
         jmod_slice_z: Optional[str] = None,
@@ -372,12 +459,9 @@ class CudaPoissonSolver:
         """Construct from a single-column signal file using C++ resampling rules."""
 
         manifest = manifest_path or default_world_path()
-        if jmod_slice_z is not None and fm_export_layers is not None:
-            raise ValueError("provide either fm_export_layers or jmod_slice_z, not both")
+        first_r2 = _parse_first_r2_from_manifest(manifest)
         internal_slice_z = (
-            jmod_slice_z
-            if jmod_slice_z is not None
-            else _fm_slice_z_string(_parse_first_r2_from_manifest(manifest))
+            jmod_slice_z if jmod_slice_z is not None else _fm_slice_z_string(first_r2)
         )
 
         obj = cls.__new__(cls)
@@ -396,10 +480,48 @@ class CudaPoissonSolver:
             int(cuda_tol_batch_first),
             int(cuda_tol_batch_next),
         )
-        n_fm = int(obj._impl.buffer_shape[0])
-        obj._fm_export_layers = _normalize_fm_export_layers(fm_export_layers, n_fm)
         obj._first_r2_layer = int(obj._impl.first_r2_layer)
+        obj._configure_fm_export(
+            fm_nz=fm_nz,
+            fm_height=fm_height,
+            fm_mumax_nz=fm_mumax_nz,
+        )
         return obj
+
+    def _configure_fm_export(
+        self,
+        *,
+        fm_nz: Optional[str],
+        fm_height: Optional[float],
+        fm_mumax_nz: int,
+    ) -> None:
+        if fm_nz is not None and fm_height is not None:
+            raise ValueError("provide either fm_nz or fm_height, not both")
+        if int(fm_mumax_nz) <= 0:
+            raise ValueError("fm_mumax_nz must be > 0")
+
+        self._fm_mumax_nz = int(fm_mumax_nz)
+        self._fm_export_mode = "full"
+        self._fm_export_layers = tuple(range(self.fm_layer_count))
+        self._fm_height = None
+
+        if fm_nz is not None:
+            self._fm_export_mode = "layer"
+            self._fm_export_layers = parse_fm_nz_spec(
+                fm_nz,
+                self.fm_layer_count,
+                self._fm_mumax_nz,
+            )
+            return
+
+        if fm_height is not None:
+            if float(fm_height) <= 0.0:
+                raise ValueError("fm_height must be > 0")
+            self._fm_export_mode = "height"
+            self._fm_height = float(fm_height)
+            return
+
+        self._fm_mumax_nz = self.fm_layer_count
 
     @property
     def current_step(self) -> int:
@@ -420,16 +542,34 @@ class CudaPoissonSolver:
         return bool(self._impl.exhausted)
 
     @property
-    def fm_export_layers(self) -> Tuple[int, ...]:
-        """FM layer indices exported to mumax+ (0 = layer at Pt interface)."""
-
-        return self._fm_export_layers
-
-    @property
     def fm_layer_count(self) -> int:
         """Number of FM layers in the Poisson world (before export selection)."""
 
         return int(self._impl.buffer_shape[0])
+
+    @property
+    def fm_export_mode(self) -> str:
+        """Configured export mode: ``full``, ``layer``, or ``height``."""
+
+        return self._fm_export_mode
+
+    @property
+    def fm_mumax_nz(self) -> int:
+        """Number of z cells in returned mumax+ current frames."""
+
+        return self._fm_mumax_nz
+
+    @property
+    def fm_export_layers(self) -> Tuple[int, ...]:
+        """Poisson source layer index/indices used in layer/full export."""
+
+        return self._fm_export_layers
+
+    @property
+    def fm_height(self) -> Optional[float]:
+        """Height [m] used in height export, or ``None`` otherwise."""
+
+        return self._fm_height
 
     @property
     def first_fm_layer(self) -> int:
@@ -448,7 +588,7 @@ class CudaPoissonSolver:
         """Returned ``jmod``/``jcur`` shape as ``(3, nz_export, ny, nx)``."""
 
         _, ny, nx, _ = self.internal_output_shape
-        return (3, len(self._fm_export_layers), ny, nx)
+        return (3, self._fm_mumax_nz, ny, nx)
 
     @property
     def world_shape(self) -> Tuple[int, int, int]:
@@ -485,13 +625,32 @@ class CudaPoissonSolver:
 
         self._impl.reset()
 
-    def _select_fm_export(self, frame: np.ndarray) -> np.ndarray:
+    def _map_fm_export(self, frame: np.ndarray) -> np.ndarray:
         arr = _as_mumax_vector_frame(frame)
-        if len(self._fm_export_layers) == self.fm_layer_count and self._fm_export_layers == tuple(
-            range(self.fm_layer_count)
-        ):
+        _, ny, nx = arr.shape[1:]
+
+        if self._fm_export_mode == "full":
             return arr
-        return arr[:, list(self._fm_export_layers), ...]
+
+        if self._fm_export_mode == "layer":
+            layers = self._fm_export_layers
+            if len(layers) == 1:
+                slab = arr[:, layers[0] : layers[0] + 1, ...]
+                return np.ascontiguousarray(
+                    np.broadcast_to(slab, (3, self._fm_mumax_nz, ny, nx)).copy(),
+                    dtype=np.float32,
+                )
+            return np.ascontiguousarray(arr[:, list(layers), ...], dtype=np.float32)
+
+        if self._fm_height is None:
+            raise RuntimeError("height export is missing fm_height")
+        out = np.empty((3, self._fm_mumax_nz, ny, nx), dtype=np.float32)
+        fm_cz = self._fm_height / self._fm_mumax_nz
+        poisson_cz = self.cellsize[2]
+        for iz in range(self._fm_mumax_nz):
+            z_mid = (iz + 0.5) * fm_cz
+            out[:, iz, ...] = _interp_poisson_stack_at_z(arr, z_mid, poisson_cz)
+        return out
 
     def iterate(self) -> PoissonStepResult:
         """Solve the next contact-potential frame.
@@ -499,16 +658,15 @@ class CudaPoissonSolver:
         Returns
         -------
         PoissonStepResult
-            ``jmod`` and ``jcur`` are independent ``float32`` NumPy arrays shaped for
-            the selected FM export layers. Use :meth:`PoissonStepResult.iter_fm_layers`
-            to assign currents layer by layer. The next call to ``iterate`` will not
+            ``jmod`` and ``jcur`` are independent ``float32`` NumPy arrays already
+            mapped to ``self.output_shape``. The next call to ``iterate`` will not
             mutate previously returned arrays.
         """
 
         raw = self._impl.iterate()
         return PoissonStepResult(
-            jmod=self._select_fm_export(raw["jmod"]),
-            jcur=self._select_fm_export(raw["jcur"]),
+            jmod=self._map_fm_export(raw["jmod"]),
+            jcur=self._map_fm_export(raw["jcur"]),
             stats=_stats_from_dict(raw["stats"]),
         )
 
@@ -517,14 +675,14 @@ class CudaPoissonSolver:
         grid_shape: Any,
         cellsize: Optional[Tuple[float, float, float]] = None,
         *,
+        check_cellsize_z: bool = True,
         rtol: float = 1e-6,
     ) -> Dict[str, Any]:
-        """Check exported current frames against a mumax+ ferromagnet grid.
+        """Check Poisson xy grid and cell size against a mumax+ ferromagnet grid.
 
-        Compares the mumax spatial grid ``(nz, ny, nx)`` — or a vector field
-        ``(3, nz, ny, nx)`` — to the exported FM layers. Does not compare against
-        the full Poisson world shape. Raises if the mumax grid requests more FM
-        layers than Poisson provides, or if ``ny`` / ``nx`` differ.
+        Compares the mumax grid shape to ``self.output_shape``. Set
+        ``check_cellsize_z=False`` when mumax+ ``cz`` intentionally differs from
+        Poisson ``cz``.
 
         This method only inspects metadata and does not advance the Poisson
         contact-potential series.
@@ -532,25 +690,26 @@ class CudaPoissonSolver:
 
         expected = self.output_shape[1:]
         actual = _spatial_shape(grid_shape)
-        if actual[0] > self.fm_layer_count:
-            raise ValueError(
-                f"mumax grid requests nz={actual[0]} FM layers but Poisson only has "
-                f"{self.fm_layer_count} FM layers "
-                f"(world z indices {self.first_fm_layer}:{self.world_shape[0]})"
-            )
         if actual != expected:
             raise ValueError(
-                f"Poisson export shape {expected} is incompatible with mumax grid shape "
-                f"{actual} (fm_export_layers={self.fm_export_layers})"
+                f"Poisson export shape {expected} is incompatible with mumax grid "
+                f"shape {actual} (mode={self.fm_export_mode})"
             )
 
         if cellsize is not None:
             cellsize_actual = tuple(float(v) for v in cellsize)
             if len(cellsize_actual) != 3:
                 raise ValueError("cellsize must have length 3")
-            if not np.allclose(cellsize_actual, self.cellsize, rtol=rtol, atol=0.0):
+            poisson_cs = self.cellsize
+            axes = (0, 1, 2) if check_cellsize_z else (0, 1)
+            if not np.allclose(
+                [cellsize_actual[i] for i in axes],
+                [poisson_cs[i] for i in axes],
+                rtol=rtol,
+                atol=0.0,
+            ):
                 raise ValueError(
-                    f"Poisson cellsize {self.cellsize} is incompatible with {cellsize_actual}"
+                    f"Poisson cellsize {poisson_cs} is incompatible with {cellsize_actual}"
                 )
 
         return {
@@ -558,7 +717,9 @@ class CudaPoissonSolver:
             "cellsize": self.cellsize,
             "n_steps": self.n_steps,
             "world_shape": self.world_shape,
-            "fm_export_layers": self.fm_export_layers,
             "fm_layer_count": self.fm_layer_count,
             "first_fm_layer": self.first_fm_layer,
+            "fm_export_mode": self.fm_export_mode,
+            "fm_export_layers": self.fm_export_layers,
+            "fm_height": self.fm_height,
         }

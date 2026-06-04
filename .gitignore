@@ -21,3 +21,4 @@ docs/_build
 *csv
 poisson-cpp/
 !mumaxplus/poisson/defaults/*
+!CMakeLists.txt
