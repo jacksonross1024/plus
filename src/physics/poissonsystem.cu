@@ -156,10 +156,15 @@ __global__ static void k_construct(LinearSystem::CuData linsys,
 
     bool anisotropic = conductivity.ncomp > 1;
 
-    // Return the average conductivity of two cells
+    // Return the average conductivity of two cells.
+    // Diagonal (positive) components use a geometric mean; signed off-diagonal
+    // AMR components use an arithmetic mean to avoid sqrt(negative).
     auto avgConductivity = [&conductivity](int idx1, int idx2, int comp) {
       real c1 = conductivity.valueAt(idx1, comp);
       real c2 = conductivity.valueAt(idx2, comp);
+      if (comp >= 3) {
+        return real(0.5) * (c1 + c2);
+      }
       return sqrt(c1 * c2);
     };
 

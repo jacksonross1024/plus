@@ -5,6 +5,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -35,6 +36,42 @@ __global__ void k_spmv(int n,
     v -= offd[k] * xvec[col_idx[k]];
   }
   y[row] = v;
+}
+
+__global__ void k_apply_skew(int n,
+                             const int* row_off,
+                             const int* col_idx,
+                             const double* val,
+                             const double* xvec,
+                             double* y) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= n) {
+    return;
+  }
+  double acc = 0.0;
+  for (int k = row_off[row]; k < row_off[row + 1]; ++k) {
+    // skew_values store true K[row,col] coefficients (not the SPD minus convention).
+    acc += val[k] * xvec[col_idx[k]];
+  }
+  y[row] = acc;
+}
+
+__global__ void k_picard_rhs(int n,
+                             const double* rhs_s,
+                             const double* rhs_k,
+                             const double* kx,
+                             double* rhs_out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    rhs_out[i] = rhs_s[i] + rhs_k[i] - kx[i];
+  }
+}
+
+__global__ void k_abs_diff(int n, const double* a, const double* b, double* out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = fabs(a[i] - b[i]);
+  }
 }
 
 __global__ void k_residual(double* r, const double* rhs, const double* ax, int n) {
@@ -175,46 +212,6 @@ PoissonPcgCuda::PoissonPcgCuda(const PoissonWorld& world) : world_(&world) {
     return;
   }
 
-  const auto& row_off_host = world_->row_offsets();
-  const auto& col_idx_host = world_->col_indices();
-  const auto& off_host = world_->offdiag_conductance();
-  const auto& diag_host = world_->diagonal();
-  const std::size_t nnz = off_host.size();
-
-  std::vector<double> inv_diag(static_cast<std::size_t>(n_));
-  std::vector<double> offd_d(nnz);
-  std::vector<double> diag_d(static_cast<std::size_t>(n_));
-  for (int i = 0; i < n_; ++i) {
-    const double d = static_cast<double>(diag_host[static_cast<std::size_t>(i)]);
-    inv_diag[static_cast<std::size_t>(i)] = 1.0 / std::max(d, 1e-30);
-    diag_d[static_cast<std::size_t>(i)] = d;
-  }
-  for (std::size_t k = 0; k < nnz; ++k) {
-    offd_d[k] = static_cast<double>(off_host[k]);
-  }
-
-  check_cuda(cudaMalloc(&d_row_off_, (static_cast<std::size_t>(n_) + 1u) * sizeof(int)),
-             "cudaMalloc row_off");
-  check_cuda(cudaMalloc(&d_col_idx_, nnz * sizeof(int)), "cudaMalloc col_idx");
-  check_cuda(cudaMalloc(&d_offd_, nnz * sizeof(double)), "cudaMalloc offd");
-  check_cuda(cudaMalloc(&d_diag_, static_cast<std::size_t>(n_) * sizeof(double)), "cudaMalloc diag");
-  check_cuda(cudaMalloc(&d_inv_diag_, static_cast<std::size_t>(n_) * sizeof(double)),
-             "cudaMalloc inv_diag");
-  check_cuda(cudaMemcpy(d_row_off_, row_off_host.data(),
-                        (static_cast<std::size_t>(n_) + 1u) * sizeof(int),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy row_off");
-  check_cuda(cudaMemcpy(d_col_idx_, col_idx_host.data(), nnz * sizeof(int), cudaMemcpyHostToDevice),
-             "cudaMemcpy col_idx");
-  check_cuda(cudaMemcpy(d_offd_, offd_d.data(), nnz * sizeof(double), cudaMemcpyHostToDevice),
-             "cudaMemcpy offd");
-  check_cuda(cudaMemcpy(d_diag_, diag_d.data(), static_cast<std::size_t>(n_) * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy diag");
-  check_cuda(cudaMemcpy(d_inv_diag_, inv_diag.data(), static_cast<std::size_t>(n_) * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy inv_diag");
-
   check_cuda(cudaMalloc(&d_x_, static_cast<std::size_t>(n_) * sizeof(double)), "cudaMalloc x");
   check_cuda(cudaMalloc(&d_rhs_, static_cast<std::size_t>(n_) * sizeof(double)), "cudaMalloc rhs");
   check_cuda(cudaMalloc(&d_r_, static_cast<std::size_t>(n_) * sizeof(double)), "cudaMalloc r");
@@ -227,7 +224,187 @@ PoissonPcgCuda::PoissonPcgCuda(const PoissonWorld& world) : world_(&world) {
   check_cuda(cudaMalloc(&d_alpha_, sizeof(double)), "cudaMalloc alpha");
   check_cuda(cudaMalloc(&d_beta_, sizeof(double)), "cudaMalloc beta");
   check_cuda(cudaMalloc(&d_pcg_fail_, sizeof(int)), "cudaMalloc pcg_fail");
+
+  upload_spd_operator(world);
   reset_solution();
+}
+
+void PoissonPcgCuda::free_skew_device() {
+  cudaFree(d_skew_row_off_);
+  cudaFree(d_skew_col_idx_);
+  cudaFree(d_skew_val_);
+  d_skew_row_off_ = nullptr;
+  d_skew_col_idx_ = nullptr;
+  d_skew_val_ = nullptr;
+  skew_nnz_ = 0;
+  has_skew_ = false;
+}
+
+void PoissonPcgCuda::free_picard_device() {
+  cudaFree(d_rhs_s_);
+  cudaFree(d_rhs_k_);
+  cudaFree(d_rhs_picard_);
+  cudaFree(d_kx_);
+  cudaFree(d_prev_rhs_);
+  cudaFree(d_prev_x_);
+  d_rhs_s_ = nullptr;
+  d_rhs_k_ = nullptr;
+  d_rhs_picard_ = nullptr;
+  d_kx_ = nullptr;
+  d_prev_rhs_ = nullptr;
+  d_prev_x_ = nullptr;
+}
+
+void PoissonPcgCuda::ensure_picard_buffers() const {
+  if (n_ <= 0 || d_rhs_s_ != nullptr) {
+    return;
+  }
+  check_cuda(cudaMalloc(&d_rhs_s_, static_cast<std::size_t>(n_) * sizeof(double)),
+             "cudaMalloc rhs_s");
+  check_cuda(cudaMalloc(&d_rhs_k_, static_cast<std::size_t>(n_) * sizeof(double)),
+             "cudaMalloc rhs_k");
+  check_cuda(cudaMalloc(&d_rhs_picard_, static_cast<std::size_t>(n_) * sizeof(double)),
+             "cudaMalloc rhs_picard");
+  check_cuda(cudaMalloc(&d_kx_, static_cast<std::size_t>(n_) * sizeof(double)), "cudaMalloc kx");
+  check_cuda(cudaMalloc(&d_prev_rhs_, static_cast<std::size_t>(n_) * sizeof(double)),
+             "cudaMalloc prev_rhs");
+  check_cuda(cudaMalloc(&d_prev_x_, static_cast<std::size_t>(n_) * sizeof(double)),
+             "cudaMalloc prev_x");
+}
+
+void PoissonPcgCuda::upload_spd_operator(const PoissonWorld& world) {
+  world_ = &world;
+  const int n = world.unknown_count();
+  if (n != n_) {
+    throw std::runtime_error("upload_spd_operator: unknown count changed; recreate solver");
+  }
+  if (n <= 0) {
+    return;
+  }
+
+  const auto& row_off_host = world.row_offsets();
+  const auto& col_idx_host = world.col_indices();
+  const auto& off_host = world.offdiag_conductance();
+  const auto& diag_host = world.diagonal();
+  const int nnz = static_cast<int>(off_host.size());
+
+  std::vector<double> inv_diag(static_cast<std::size_t>(n));
+  std::vector<double> offd_d(static_cast<std::size_t>(nnz));
+  std::vector<double> diag_d(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    const double d = static_cast<double>(diag_host[static_cast<std::size_t>(i)]);
+    inv_diag[static_cast<std::size_t>(i)] = 1.0 / std::max(d, 1e-30);
+    diag_d[static_cast<std::size_t>(i)] = d;
+  }
+  for (int k = 0; k < nnz; ++k) {
+    offd_d[static_cast<std::size_t>(k)] = static_cast<double>(off_host[static_cast<std::size_t>(k)]);
+  }
+
+  if (d_row_off_ == nullptr || nnz != nnz_) {
+    cudaFree(d_row_off_);
+    cudaFree(d_col_idx_);
+    cudaFree(d_offd_);
+    cudaFree(d_diag_);
+    cudaFree(d_inv_diag_);
+    d_row_off_ = nullptr;
+    d_col_idx_ = nullptr;
+    d_offd_ = nullptr;
+    d_diag_ = nullptr;
+    d_inv_diag_ = nullptr;
+    check_cuda(cudaMalloc(&d_row_off_, (static_cast<std::size_t>(n) + 1u) * sizeof(int)),
+               "cudaMalloc row_off");
+    check_cuda(cudaMalloc(&d_col_idx_, static_cast<std::size_t>(nnz) * sizeof(int)),
+               "cudaMalloc col_idx");
+    check_cuda(cudaMalloc(&d_offd_, static_cast<std::size_t>(nnz) * sizeof(double)),
+               "cudaMalloc offd");
+    check_cuda(cudaMalloc(&d_diag_, static_cast<std::size_t>(n) * sizeof(double)),
+               "cudaMalloc diag");
+    check_cuda(cudaMalloc(&d_inv_diag_, static_cast<std::size_t>(n) * sizeof(double)),
+               "cudaMalloc inv_diag");
+    nnz_ = nnz;
+  }
+
+  check_cuda(cudaMemcpy(d_row_off_, row_off_host.data(),
+                        (static_cast<std::size_t>(n) + 1u) * sizeof(int),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy row_off");
+  if (nnz > 0) {
+    check_cuda(cudaMemcpy(d_col_idx_, col_idx_host.data(),
+                          static_cast<std::size_t>(nnz) * sizeof(int), cudaMemcpyHostToDevice),
+               "cudaMemcpy col_idx");
+    check_cuda(cudaMemcpy(d_offd_, offd_d.data(), static_cast<std::size_t>(nnz) * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy offd");
+  }
+  check_cuda(cudaMemcpy(d_diag_, diag_d.data(), static_cast<std::size_t>(n) * sizeof(double),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy diag");
+  check_cuda(cudaMemcpy(d_inv_diag_, inv_diag.data(), static_cast<std::size_t>(n) * sizeof(double),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy inv_diag");
+}
+
+void PoissonPcgCuda::clear_skew_operator() {
+  free_skew_device();
+}
+
+void PoissonPcgCuda::upload_skew_operator(const PoissonWorld& world) {
+  world_ = &world;
+  if (!world.ahe_enabled()) {
+    clear_skew_operator();
+    return;
+  }
+  const int n = world.unknown_count();
+  if (n != n_) {
+    throw std::runtime_error("upload_skew_operator: unknown count changed");
+  }
+  if (n <= 0) {
+    clear_skew_operator();
+    return;
+  }
+
+  const auto& row_off = world.skew_row_offsets();
+  const auto& col_idx = world.skew_col_indices();
+  const auto& vals = world.skew_values();
+  if (row_off.size() != static_cast<std::size_t>(n + 1)) {
+    throw std::runtime_error("upload_skew_operator: skew CSR row offsets invalid");
+  }
+  const int nnz = static_cast<int>(vals.size());
+
+  // Convert stored SPD-style offdiag (-A) into true K values for apply_skew.
+  // World currently stores skew offdiag with the same "minus coeff" convention as SPD.
+  std::vector<double> true_k(static_cast<std::size_t>(nnz));
+  for (int k = 0; k < nnz; ++k) {
+    true_k[static_cast<std::size_t>(k)] =
+        -static_cast<double>(vals[static_cast<std::size_t>(k)]);
+  }
+
+  if (d_skew_row_off_ == nullptr || nnz != skew_nnz_) {
+    free_skew_device();
+    check_cuda(cudaMalloc(&d_skew_row_off_, (static_cast<std::size_t>(n) + 1u) * sizeof(int)),
+               "cudaMalloc skew row_off");
+    check_cuda(cudaMalloc(&d_skew_col_idx_, static_cast<std::size_t>(std::max(nnz, 1)) * sizeof(int)),
+               "cudaMalloc skew col_idx");
+    check_cuda(cudaMalloc(&d_skew_val_,
+                          static_cast<std::size_t>(std::max(nnz, 1)) * sizeof(double)),
+               "cudaMalloc skew val");
+    skew_nnz_ = nnz;
+  }
+
+  check_cuda(cudaMemcpy(d_skew_row_off_, row_off.data(),
+                        (static_cast<std::size_t>(n) + 1u) * sizeof(int),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy skew row_off");
+  if (nnz > 0) {
+    check_cuda(cudaMemcpy(d_skew_col_idx_, col_idx.data(),
+                          static_cast<std::size_t>(nnz) * sizeof(int), cudaMemcpyHostToDevice),
+               "cudaMemcpy skew col_idx");
+    check_cuda(cudaMemcpy(d_skew_val_, true_k.data(),
+                          static_cast<std::size_t>(nnz) * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy skew val");
+  }
+  has_skew_ = true;
 }
 
 void PoissonPcgCuda::set_tolerance_check_batches(int first_batch, int subsequent_batch) {
@@ -262,38 +439,30 @@ PoissonPcgCuda::~PoissonPcgCuda() {
   cudaFree(d_alpha_);
   cudaFree(d_beta_);
   cudaFree(d_pcg_fail_);
+  free_skew_device();
+  free_picard_device();
   if (handle_cublas_) {
     cublasDestroy(static_cast<cublasHandle_t>(handle_cublas_));
   }
 }
 
-PcgResult PoissonPcgCuda::solve(const std::vector<double>& rhs, std::vector<double>& x) const {
+PcgResult PoissonPcgCuda::solve_device_rhs(double* d_rhs) const {
   PcgResult result;
   const int n = n_;
-  if (static_cast<int>(rhs.size()) != n) {
-    throw std::runtime_error("PCG rhs size does not match operator size");
-  }
   if (n == 0) {
     result.converged = true;
     return result;
   }
-  if (x.size() != rhs.size()) {
-    x.assign(rhs.size(), 0.0);
-    check_cuda(cudaMemset(d_x_, 0, static_cast<std::size_t>(n) * sizeof(double)), "cudaMemset x");
-  }
 
   cublasHandle_t h = static_cast<cublasHandle_t>(handle_cublas_);
   const cudaStream_t stream = 0;
-  check_cuda(cudaMemcpy(d_rhs_, rhs.data(), static_cast<std::size_t>(n) * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy rhs");
   check_cuda(cudaMemset(d_pcg_fail_, 0, sizeof(int)), "cudaMemset pcg_fail");
 
   launch_spmv(n, d_row_off_, d_col_idx_, d_offd_, d_diag_, d_x_, d_ax_, stream);
-  launch_residual(d_r_, d_rhs_, d_ax_, n, stream);
+  launch_residual(d_r_, d_rhs, d_ax_, n, stream);
   check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after init residual");
 
-  const double rhs_linf = device_max_abs(h, n, d_rhs_);
+  const double rhs_linf = device_max_abs(h, n, d_rhs);
   const double r0_linf = device_max_abs(h, n, d_r_);
   result.rhs_inf_norm = rhs_linf;
   result.initial_residual_max_norm = r0_linf;
@@ -301,9 +470,6 @@ PcgResult PoissonPcgCuda::solve(const std::vector<double>& rhs, std::vector<doub
   result.residual_relative = (rhs_linf > 0.0) ? (r0_linf / rhs_linf) : 0.0;
   if (residual_meets_tolerance(result.residual_max_norm, rhs_linf, tolerance_)) {
     result.converged = true;
-    check_cuda(cudaMemcpy(x.data(), d_x_, static_cast<std::size_t>(n) * sizeof(double),
-                          cudaMemcpyDeviceToHost),
-               "cudaMemcpy x out");
     return result;
   }
 
@@ -321,11 +487,8 @@ PcgResult PoissonPcgCuda::solve(const std::vector<double>& rhs, std::vector<doub
              "cudaMemcpy rz_init");
   if (!(rz_init_host > 0.0)) {
     check_cublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST), "cublas pointer HOST");
-    result.numerical_failure = true;
     result.converged = residual_meets_tolerance(result.residual_max_norm, rhs_linf, tolerance_);
-    check_cuda(cudaMemcpy(x.data(), d_x_, static_cast<std::size_t>(n) * sizeof(double),
-                          cudaMemcpyDeviceToHost),
-               "cudaMemcpy x out");
+    result.numerical_failure = !result.converged;
     return result;
   }
 
@@ -360,12 +523,149 @@ PcgResult PoissonPcgCuda::solve(const std::vector<double>& rhs, std::vector<doub
   int fail_h = 0;
   check_cuda(cudaMemcpy(&fail_h, d_pcg_fail_, sizeof(int), cudaMemcpyDeviceToHost),
              "cudaMemcpy pcg_fail");
-  result.numerical_failure = fail_h != 0;
-  result.converged = result.converged ||
-                     residual_meets_tolerance(result.residual_max_norm, rhs_linf, tolerance_);
+  // If the residual already meets tolerance, ignore late-batch rz<=0 flags from
+  // floating-point oversolve after convergence.
+  result.converged = residual_meets_tolerance(result.residual_max_norm, rhs_linf, tolerance_);
+  result.numerical_failure = (fail_h != 0) && !result.converged;
   check_cublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST), "cublas pointer HOST final");
+  return result;
+}
+
+PcgResult PoissonPcgCuda::solve(const std::vector<double>& rhs, std::vector<double>& x) const {
+  PcgResult result;
+  const int n = n_;
+#ifndef NDEBUG
+  if (static_cast<int>(rhs.size()) != n) {
+    throw std::runtime_error("PCG rhs size does not match operator size");
+  }
+#endif
+  if (n == 0) {
+    result.converged = true;
+    return result;
+  }
+  if (x.size() != static_cast<std::size_t>(n)) {
+    x.assign(static_cast<std::size_t>(n), 0.0);
+    check_cuda(cudaMemset(d_x_, 0, static_cast<std::size_t>(n) * sizeof(double)), "cudaMemset x");
+  }
+
+  check_cuda(cudaMemcpy(d_rhs_, rhs.data(), static_cast<std::size_t>(n) * sizeof(double),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy rhs");
+  result = solve_device_rhs(d_rhs_);
   check_cuda(cudaMemcpy(x.data(), d_x_, static_cast<std::size_t>(n) * sizeof(double),
                         cudaMemcpyDeviceToHost),
              "cudaMemcpy x out");
   return result;
+}
+
+PicardResult PoissonPcgCuda::solve_picard(const std::vector<double>& rhs_s,
+                                          const std::vector<double>& rhs_k,
+                                          int picard_sweeps,
+                                          double picard_tolerance,
+                                          std::vector<double>& x) const {
+  PicardResult out;
+  const int n = n_;
+#ifndef NDEBUG
+  if (static_cast<int>(rhs_s.size()) != n || static_cast<int>(rhs_k.size()) != n) {
+    throw std::runtime_error("Picard rhs size does not match operator size");
+  }
+  if (picard_sweeps < 1) {
+    throw std::runtime_error("picard_sweeps must be >= 1");
+  }
+#endif
+  if (!has_skew_) {
+    throw std::runtime_error("solve_picard requires an uploaded skew operator");
+  }
+  if (n == 0) {
+    out.final_pcg.converged = true;
+    out.picard_sweeps_used = 0;
+    out.pcg_error = 0.0;
+    out.pcg_converged = true;
+    out.picard_error = 0.0;
+    out.note = "picard_sweeps=0 empty";
+    return out;
+  }
+  if (x.size() != static_cast<std::size_t>(n)) {
+    x.assign(static_cast<std::size_t>(n), 0.0);
+    check_cuda(cudaMemset(d_x_, 0, static_cast<std::size_t>(n) * sizeof(double)), "cudaMemset x");
+  }
+
+  ensure_picard_buffers();
+  check_cuda(cudaMemcpy(d_rhs_s_, rhs_s.data(), static_cast<std::size_t>(n) * sizeof(double),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy rhs_s");
+  check_cuda(cudaMemcpy(d_rhs_k_, rhs_k.data(), static_cast<std::size_t>(n) * sizeof(double),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy rhs_k");
+
+  const int blocks = (n + threads_per_block() - 1) / threads_per_block();
+  const cudaStream_t stream = 0;
+  double prev_rhs_inf = -1.0;
+  bool have_prev_x = false;
+  cublasHandle_t h = static_cast<cublasHandle_t>(handle_cublas_);
+
+  for (int p = 0; p < picard_sweeps; ++p) {
+    k_apply_skew<<<blocks, threads_per_block(), 0, stream>>>(
+        n, d_skew_row_off_, d_skew_col_idx_, d_skew_val_, d_x_, d_kx_);
+    k_picard_rhs<<<blocks, threads_per_block(), 0, stream>>>(
+        n, d_rhs_s_, d_rhs_k_, d_kx_, d_rhs_picard_);
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after picard rhs");
+
+    PcgResult r = solve_device_rhs(d_rhs_picard_);
+    out.total_pcg_iterations += r.iterations;
+    out.final_pcg = r;
+    out.picard_sweeps_used = p + 1;
+    out.pcg_error = r.residual_relative;
+    out.pcg_converged = r.converged;
+
+    // Picard Δx on device (no per-sweep D2H of the solution).
+    if (have_prev_x) {
+      k_abs_diff<<<blocks, threads_per_block(), 0, stream>>>(n, d_x_, d_prev_x_, d_r_);
+      check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after picard abs_diff");
+      out.picard_error = device_max_abs(h, n, d_r_);
+    } else {
+      out.picard_error = 0.0;
+    }
+    check_cuda(cudaMemcpy(d_prev_x_, d_x_, static_cast<std::size_t>(n) * sizeof(double),
+                          cudaMemcpyDeviceToDevice),
+               "cudaMemcpy prev_x");
+    have_prev_x = true;
+
+    if (r.numerical_failure) {
+      out.note = "picard_sweeps=" + std::to_string(out.picard_sweeps_used) +
+                 " pcg_err=" + std::to_string(out.pcg_error) +
+                 " picard_err=" + std::to_string(out.picard_error) +
+                 " numerical_failure";
+      break;
+    }
+
+    if (picard_tolerance > 0.0) {
+      const double rhs_inf = device_max_abs(h, n, d_rhs_picard_);
+      const bool rhs_stalled =
+          prev_rhs_inf >= 0.0 && std::fabs(rhs_inf - prev_rhs_inf) < picard_tolerance;
+      const bool x_stalled = p > 0 && out.picard_error < picard_tolerance;
+      if (rhs_stalled || x_stalled) {
+        out.note = "picard_sweeps=" + std::to_string(out.picard_sweeps_used) +
+                   " pcg_err=" + std::to_string(out.pcg_error) +
+                   " picard_err=" + std::to_string(out.picard_error) + " early";
+        break;
+      }
+      prev_rhs_inf = rhs_inf;
+      check_cuda(cudaMemcpy(d_prev_rhs_, d_rhs_picard_,
+                            static_cast<std::size_t>(n) * sizeof(double),
+                            cudaMemcpyDeviceToDevice),
+                 "cudaMemcpy prev rhs");
+    }
+  }
+
+  if (out.note.empty()) {
+    out.note = "picard_sweeps=" + std::to_string(out.picard_sweeps_used) +
+               " pcg_err=" + std::to_string(out.pcg_error) +
+               " picard_err=" + std::to_string(out.picard_error);
+  }
+  out.final_pcg.iterations = out.total_pcg_iterations;
+  check_cuda(cudaMemcpy(x.data(), d_x_, static_cast<std::size_t>(n) * sizeof(double),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy x out");
+  return out;
 }

@@ -13,9 +13,9 @@ def compute_conductivity_tensor(magnet):
     cond_XX = conductivity * (1.0 - prefactor * (mx * mx - 1.0 / 3.0))
     cond_YY = conductivity * (1.0 - prefactor * (my * my - 1.0 / 3.0))
     cond_ZZ = conductivity * (1.0 - prefactor * (mz * mz - 1.0 / 3.0))
-    cond_XY = conductivity * prefactor * mx * my
-    cond_XZ = conductivity * prefactor * mx * mz
-    cond_YZ = conductivity * prefactor * my * mz
+    cond_XY = -conductivity * prefactor * mx * my
+    cond_XZ = -conductivity * prefactor * mx * mz
+    cond_YZ = -conductivity * prefactor * my * mz
 
     return np.array([cond_XX, cond_YY, cond_ZZ, cond_XY, cond_XZ, cond_YZ])
 

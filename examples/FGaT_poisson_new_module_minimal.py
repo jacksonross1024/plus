@@ -33,6 +33,10 @@ def main() -> None:
     print("jmod max abs:", float(np.max(np.abs(frame.jmod))))
     print("jcur max abs:", float(np.max(np.abs(frame.jcur))))
 
+    v_hall = solver.hall_potentials()
+    print("Hall voltages [V]:", v_hall)
+    assert v_hall.shape == (solver.num_contacts,)
+
 
 if __name__ == "__main__":
     main()

@@ -98,12 +98,16 @@ void apply_global_amplitude_scale(std::vector<double>& raw, double v_scale) {
 ContactPotentials load_signal_file_to_contact_potentials(const std::string& path,
                                                          int nt,
                                                          double v_scale,
-                                                         int skip_first) {
+                                                         int skip_first,
+                                                         int num_contacts) {
   if (nt <= 0) {
     throw std::runtime_error("nt must be > 0");
   }
   if (skip_first < 0) {
     throw std::runtime_error("skip_first must be >= 0");
+  }
+  if (num_contacts <= 0) {
+    throw std::runtime_error("num_contacts must be > 0");
   }
 
   auto raw = read_single_column_signal_file(path);
@@ -111,8 +115,10 @@ ContactPotentials load_signal_file_to_contact_potentials(const std::string& path
     throw std::runtime_error("skip_first removes the entire signal");
   }
   raw.erase(raw.begin(), raw.begin() + skip_first);
-  if (raw.size() < 3) {
-    throw std::runtime_error("need at least 3 samples for three contact segments");
+  if (raw.size() < static_cast<std::size_t>(num_contacts)) {
+    throw std::runtime_error("need at least " + std::to_string(num_contacts) +
+                             " samples for " + std::to_string(num_contacts) +
+                             " contact segments");
   }
   for (double sample : raw) {
     if (!std::isfinite(sample)) {
@@ -122,15 +128,14 @@ ContactPotentials load_signal_file_to_contact_potentials(const std::string& path
   apply_global_amplitude_scale(raw, v_scale);
 
   const int n = static_cast<int>(raw.size());
-  const int i1 = n / 3;
-  const int i2 = (2 * n) / 3;
-  const auto c0 = resample_segment_to_nt(std::vector<double>(raw.begin(), raw.begin() + i1), nt);
-  const auto c1 = resample_segment_to_nt(std::vector<double>(raw.begin() + i1, raw.begin() + i2), nt);
-  const auto c2 = resample_segment_to_nt(std::vector<double>(raw.begin() + i2, raw.end()), nt);
-
   ContactPotentials potentials;
-  potentials.c0.assign(c0.begin(), c0.end());
-  potentials.c1.assign(c1.begin(), c1.end());
-  potentials.c2.assign(c2.begin(), c2.end());
+  potentials.channels.resize(static_cast<std::size_t>(num_contacts));
+  for (int c = 0; c < num_contacts; ++c) {
+    const int start = (c * n) / num_contacts;
+    const int end = ((c + 1) * n) / num_contacts;
+    const auto segment =
+        resample_segment_to_nt(std::vector<double>(raw.begin() + start, raw.begin() + end), nt);
+    potentials.channels[static_cast<std::size_t>(c)].assign(segment.begin(), segment.end());
+  }
   return potentials;
 }

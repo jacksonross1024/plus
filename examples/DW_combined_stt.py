@@ -48,7 +48,7 @@ def setup_magnet():
     # Permalloy-like parameters (see examples/standardproblem5.py, MRAM_bit_switch.py)
     magnet.msat = 800e3
     magnet.aex = 13e-12
-    magnet.alpha = 0.1
+    magnet.alpha = 0.01
     magnet.ku1 = 1.0e5
     magnet.anisU = (0, 0, 1)
 
@@ -91,9 +91,9 @@ def configure_zhang_li(magnet):
     magnet.enable_combined_spin_transfer_torque = False
     magnet.enable_zhang_li_torque = True
     magnet.enable_slonczewski_torque = False
-    magnet.xi = 0.2
-    magnet.pol = 1.0
-    magnet.jcur = (6e11, 0.0, 0.0)
+    magnet.xi = 0.02
+    magnet.pol = 0.57
+    magnet.jcur = (0.6e11, 0.0, 0.0)
     magnet.jcur_stt = (0.0, 0.0, 0.0)
     magnet.jcur_zl = (0.0, 0.0, 0.0)
 
@@ -108,7 +108,7 @@ def configure_slonczewski(magnet):
     magnet.fixed_layer = (0.0, 0.0, 1.0)
     magnet.fixed_layer_on_top = True
     area = magnet.grid.size[0] * magnet.grid.size[1] * magnet.world.cellsize[0] * magnet.world.cellsize[1]
-    jz = -4e-3 / area
+    jz = -0.4e-3 / area
     magnet.jcur = (0.0, 0.0, jz)
     magnet.jcur_stt = (0.0, 0.0, 0.0)
     magnet.jcur_zl = (0.0, 0.0, 0.0)
@@ -118,7 +118,7 @@ def configure_combined(magnet):
     magnet.enable_combined_spin_transfer_torque = True
     magnet.enable_zhang_li_torque = True
     magnet.enable_slonczewski_torque = True
-    magnet.xi = 0.2
+    magnet.xi = 0.02
     magnet.pol = 0.57
     magnet.Lambda = 2.0
     magnet.epsilon_prime = 0.5
@@ -126,8 +126,8 @@ def configure_combined(magnet):
     magnet.fixed_layer_on_top = True
     area = magnet.grid.size[0] * magnet.grid.size[1] * magnet.world.cellsize[0] * magnet.world.cellsize[1]
     magnet.jcur = (0.0, 0.0, 0.0)
-    magnet.jcur_zl = (6e11, 0.0, 0.0)
-    magnet.jcur_stt = (0.0, 0.0, -4e-3 / area)
+    magnet.jcur_zl = (0.6e11, 0.0, 0.0)
+    magnet.jcur_stt = (0.0, 0.0, -0.4e-3 / area)
 
 
 def main():

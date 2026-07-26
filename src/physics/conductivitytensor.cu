@@ -25,9 +25,10 @@ __global__ static void k_conductTensor(CuField conductivity,
   conductivity.setValueInCell(idx, 0, c0 * (1 - fac * (m.x * m.x - 1. / 3.)));
   conductivity.setValueInCell(idx, 1, c0 * (1 - fac * (m.y * m.y - 1. / 3.)));
   conductivity.setValueInCell(idx, 2, c0 * (1 - fac * (m.z * m.z - 1. / 3.)));
-  conductivity.setValueInCell(idx, 3, c0 * fac * m.x * m.y);
-  conductivity.setValueInCell(idx, 4, c0 * fac * m.x * m.z);
-  conductivity.setValueInCell(idx, 5, c0 * fac * m.y * m.z);
+  // Correct AMR off-diagonals: Sigma = sigma0*((1+q/3)I - q m m^T)
+  conductivity.setValueInCell(idx, 3, -c0 * fac * m.x * m.y);
+  conductivity.setValueInCell(idx, 4, -c0 * fac * m.x * m.z);
+  conductivity.setValueInCell(idx, 5, -c0 * fac * m.y * m.z);
 }
 
 Field evalConductivityTensor(const Ferromagnet* magnet) {

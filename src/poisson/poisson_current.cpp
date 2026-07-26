@@ -66,9 +66,11 @@ void extract_jmod_subframe(const PoissonWorld& world,
                            const std::vector<float>& full_frame,
                            const JmodOutputSpec& spec,
                            std::vector<float>& out_frame) {
+#ifndef NDEBUG
   if (full_frame.size() != world.frame_elements()) {
     throw std::runtime_error("extract_jmod_subframe: full J frame size mismatch");
   }
+#endif
   out_frame.resize(spec.frame_elements());
   std::size_t d = 0;
   for (int iz = spec.iz0; iz < spec.iz1; ++iz) {
@@ -86,9 +88,11 @@ void extract_jmod_subframe(const PoissonWorld& world,
 void compute_j_raw_from_phi(const PoissonWorld& world,
                             const std::vector<float>& phi,
                             std::vector<float>& j_frame) {
+#ifndef NDEBUG
   if (phi.size() != static_cast<std::size_t>(world.cell_count())) {
     throw std::runtime_error("phi buffer size mismatch");
   }
+#endif
 
   const int nx = world.nx();
   const int ny = world.ny();
@@ -96,7 +100,6 @@ void compute_j_raw_from_phi(const PoissonWorld& world,
   const float dx = static_cast<float>(world.cx());
   const float dy = static_cast<float>(world.cy());
   const float dz = static_cast<float>(world.cz());
-  const auto& region = world.region();
   const auto& sigma = world.sigma();
   j_frame.assign(world.frame_elements(), 0.0f);
 
@@ -108,7 +111,7 @@ void compute_j_raw_from_phi(const PoissonWorld& world,
     for (int iy = 0; iy < ny; ++iy) {
       for (int ix = 0; ix < nx; ++ix) {
         const int cell = world.flat_index(iz, iy, ix);
-        if (region[static_cast<std::size_t>(cell)] == 0) {
+        if (!world.is_conducting(cell)) {
           continue;
         }
 
@@ -136,19 +139,38 @@ void compute_j_raw_from_phi(const PoissonWorld& world,
                         : (phi_at(iz + 1, iy, ix) - phi_at(iz - 1, iy, ix)) / (2.0f * dz);
         }
 
-        const float local_sigma = sigma[static_cast<std::size_t>(cell)];
-        j_frame[component_index(cell, 0)] = -local_sigma * dphi_dx;
-        j_frame[component_index(cell, 1)] = -local_sigma * dphi_dy;
-        j_frame[component_index(cell, 2)] = -local_sigma * dphi_dz;
+        if (!world.transport_enabled() || world.uses_scalar_transport(cell)) {
+          const float local_sigma = sigma[static_cast<std::size_t>(cell)];
+          j_frame[component_index(cell, 0)] = -local_sigma * dphi_dx;
+          j_frame[component_index(cell, 1)] = -local_sigma * dphi_dy;
+          j_frame[component_index(cell, 2)] = -local_sigma * dphi_dz;
+          continue;
+        }
+
+        const SymTensor6 S = world.sym_tensor(cell);
+        const SkewTensor3 K = world.skew_tensor(cell);
+        // J = -(Sigma_AMR + Sigma_AHE) grad phi
+        // Sigma_AHE upper triangle (xy,xz,yz) with antisymmetry.
+        const float ex = -dphi_dx;
+        const float ey = -dphi_dy;
+        const float ez = -dphi_dz;
+        const float jx = S.xx * ex + (S.xy + K.xy) * ey + (S.xz + K.xz) * ez;
+        const float jy = (S.xy - K.xy) * ex + S.yy * ey + (S.yz + K.yz) * ez;
+        const float jz = (S.xz - K.xz) * ex + (S.yz - K.yz) * ey + S.zz * ez;
+        j_frame[component_index(cell, 0)] = jx;
+        j_frame[component_index(cell, 1)] = jy;
+        j_frame[component_index(cell, 2)] = jz;
       }
     }
   }
 }
 
 void mask_jcur_fm_layers(const PoissonWorld& world, std::vector<float>& j_raw) {
+#ifndef NDEBUG
   if (j_raw.size() != world.frame_elements()) {
     throw std::runtime_error("mask_jcur_fm_layers: J frame size mismatch");
   }
+#endif
   const auto& region = world.region();
   for (int cell = 0; cell < world.cell_count(); ++cell) {
     if (region[static_cast<std::size_t>(cell)] == 2) {
@@ -318,9 +340,11 @@ void apply_jmod_postprocess(const PoissonWorld& world,
                             double decay_length,
                             std::vector<float>& j_frame,
                             std::vector<float>& pt_avg_xy) {
+#ifndef NDEBUG
   if (j_frame.size() != world.frame_elements()) {
     throw std::runtime_error("J frame size mismatch in J_mod postprocess");
   }
+#endif
 
   const int nx = world.nx();
   const int ny = world.ny();

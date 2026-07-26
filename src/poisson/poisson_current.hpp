@@ -31,6 +31,12 @@ struct StepStats {
   double residual = 0.0;
   double rhs_inf = 0.0;
   double residual_rel = 0.0;
+  /// Alias for the last inner PCG relative residual (same as residual_rel).
+  double pcg_error = 0.0;
+  bool pcg_converged = false;
+  /// Picard iterate change ‖xⁿ − xⁿ⁻¹‖_∞ (0 when Picard is not used).
+  double picard_error = 0.0;
+  int picard_sweeps_used = 0;
   double elapsed_s = 0.0;
   std::string stats_note;
 };
