@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "npy_reader.hpp"
@@ -313,6 +314,18 @@ void PoissonWorld::set_magnetization_fm_stack(const std::vector<float>& magnetiz
   // Hot path only verifies size here.
   magnetization_ = magnetization_mumax;
   magnetization_set_ = true;
+}
+
+void PoissonWorld::refresh_transport_tensors() {
+  if (!transport_enabled()) {
+    sym_tensor_.clear();
+    skew_tensor_.clear();
+    return;
+  }
+  if (!magnetization_set_) {
+    throw std::runtime_error("refresh_transport_tensors requires magnetization");
+  }
+  refresh_cell_tensors();
 }
 
 SymTensor6 PoissonWorld::sym_tensor(int cell) const {
@@ -929,6 +942,162 @@ void PoissonWorld::rebuild_transport_operators() {
     return;
   }
   build_transport_operators();
+}
+
+void PoissonWorld::build_transport_pattern_operators() {
+  // Topology-only sparsity for the GMRES device-update path. Column presence must
+  // not depend on coefficient cancellation: unit cross-stencil values can still
+  // sum to exact zero after compression and drop CSR entries that are nonzero for
+  // a real magnetization. Mark structural columns with a set instead.
+  if (!transport_enabled()) {
+    build_scalar_operator();
+    return;
+  }
+  if (unknown_to_cell_.empty()) {
+    assemble_unknown_map();
+  }
+  const int n_unknown = unknown_count();
+  std::vector<std::unordered_set<int>> pattern_cols(static_cast<std::size_t>(n_unknown));
+  diagonal_.assign(static_cast<std::size_t>(n_unknown), 1.0f);
+  rhs_weight_.assign(static_cast<std::size_t>(num_contacts_),
+                     std::vector<float>(static_cast<std::size_t>(n_unknown), 0.0f));
+
+  auto mark_entry = [&](int row_cell, int col_cell) {
+    if (col_cell < 0) {
+      return;
+    }
+    const int row = unknown_index_[static_cast<std::size_t>(row_cell)];
+    if (row < 0) {
+      return;
+    }
+    if (row_cell == col_cell) {
+      // Diagonal is injected by upload_transport_operator; keep it positive.
+      diagonal_[static_cast<std::size_t>(row)] = 1.0f;
+      return;
+    }
+    const int col = unknown_index_[static_cast<std::size_t>(col_cell)];
+    if (col >= 0) {
+      pattern_cols[static_cast<std::size_t>(row)].insert(col);
+    }
+  };
+
+  auto cell_at = [&](int jz, int jy, int jx) -> int {
+    if (!in_bounds(jx, meta_.nx) || !in_bounds(jy, meta_.ny) || !in_bounds(jz, meta_.nz)) {
+      return -1;
+    }
+    const int c = flat_index(jz, jy, jx);
+    return is_conducting(c) ? c : -1;
+  };
+
+  auto mark_diff = [&](int row_cell, int c1, int c2) {
+    mark_entry(row_cell, c1);
+    mark_entry(row_cell, c2);
+  };
+
+  auto mark_cross = [&](int cell, int nbr, int axis) {
+    const int plane = meta_.nx * meta_.ny;
+    const int iz = cell / plane;
+    const int rem = cell % plane;
+    const int iy = rem / meta_.nx;
+    const int ix = rem % meta_.nx;
+    const int niz = nbr / plane;
+    const int nrem = nbr % plane;
+    const int niy = nrem / meta_.nx;
+    const int nix = nrem % meta_.nx;
+    // Full cross stencil for all three off-diagonal tensor components.
+    if (axis == 0) {
+      mark_diff(cell, cell, cell_at(iz, iy - 1, ix));
+      mark_diff(cell, nbr, cell_at(iz, iy - 1, nix));
+      mark_diff(cell, cell_at(iz, iy + 1, ix), cell);
+      mark_diff(cell, cell_at(iz, iy + 1, nix), nbr);
+      mark_diff(cell, cell, cell_at(iz - 1, iy, ix));
+      mark_diff(cell, nbr, cell_at(iz - 1, iy, nix));
+      mark_diff(cell, cell_at(iz + 1, iy, ix), cell);
+      mark_diff(cell, cell_at(iz + 1, iy, nix), nbr);
+    } else if (axis == 1) {
+      mark_diff(cell, cell, cell_at(iz, iy, ix - 1));
+      mark_diff(cell, nbr, cell_at(iz, niy, ix - 1));
+      mark_diff(cell, cell_at(iz, iy, ix + 1), cell);
+      mark_diff(cell, cell_at(iz, niy, ix + 1), nbr);
+      mark_diff(cell, cell, cell_at(iz - 1, iy, ix));
+      mark_diff(cell, nbr, cell_at(iz - 1, niy, ix));
+      mark_diff(cell, cell_at(iz + 1, iy, ix), cell);
+      mark_diff(cell, cell_at(iz + 1, niy, ix), nbr);
+    } else {
+      mark_diff(cell, cell, cell_at(iz, iy, ix - 1));
+      mark_diff(cell, nbr, cell_at(niz, iy, ix - 1));
+      mark_diff(cell, cell_at(iz, iy, ix + 1), cell);
+      mark_diff(cell, cell_at(niz, iy, ix + 1), nbr);
+      mark_diff(cell, cell, cell_at(iz, iy - 1, ix));
+      mark_diff(cell, nbr, cell_at(niz, iy - 1, ix));
+      mark_diff(cell, cell_at(iz, iy + 1, ix), cell);
+      mark_diff(cell, cell_at(niz, iy + 1, ix), nbr);
+    }
+  };
+
+  constexpr std::array<std::array<int, 4>, 6> kNeighbors = {{
+      {{-1, 0, 0, 0}}, {{1, 0, 0, 0}}, {{0, -1, 0, 1}},
+      {{0, 1, 0, 1}},  {{0, 0, -1, 2}}, {{0, 0, 1, 2}},
+  }};
+
+  const bool need_cross = config_.amr_enabled || config_.ahe_enabled;
+  const int plane = meta_.nx * meta_.ny;
+  for (int row = 0; row < n_unknown; ++row) {
+    const int cell = unknown_to_cell_[static_cast<std::size_t>(row)];
+    mark_entry(cell, cell);
+    const int iz = cell / plane;
+    const int rem = cell % plane;
+    const int iy = rem / meta_.nx;
+    const int ix = rem % meta_.nx;
+    for (const auto& neighbor : kNeighbors) {
+      const int nix = ix + neighbor[0];
+      const int niy = iy + neighbor[1];
+      const int niz = iz + neighbor[2];
+      const int axis = neighbor[3];
+      if (!in_bounds(nix, meta_.nx) || !in_bounds(niy, meta_.ny) ||
+          !in_bounds(niz, meta_.nz)) {
+        continue;
+      }
+      const int nbr = flat_index(niz, niy, nix);
+      if (!is_conducting(nbr)) {
+        continue;
+      }
+      mark_entry(cell, cell);
+      mark_entry(cell, nbr);
+      if (need_cross) {
+        mark_cross(cell, nbr, axis);
+      }
+    }
+  }
+
+  row_offsets_.assign(static_cast<std::size_t>(n_unknown + 1), 0);
+  for (int row = 0; row < n_unknown; ++row) {
+    row_offsets_[static_cast<std::size_t>(row + 1)] =
+        row_offsets_[static_cast<std::size_t>(row)] +
+        static_cast<int>(pattern_cols[static_cast<std::size_t>(row)].size());
+  }
+  col_indices_.assign(static_cast<std::size_t>(row_offsets_.back()), -1);
+  offdiag_conductance_.assign(static_cast<std::size_t>(row_offsets_.back()), 1.0f);
+  for (int row = 0; row < n_unknown; ++row) {
+    std::vector<int> cols(pattern_cols[static_cast<std::size_t>(row)].begin(),
+                          pattern_cols[static_cast<std::size_t>(row)].end());
+    std::sort(cols.begin(), cols.end());
+    int write = row_offsets_[static_cast<std::size_t>(row)];
+    for (int col : cols) {
+      col_indices_[static_cast<std::size_t>(write)] = col;
+      // Placeholder nonzero so upload_transport_operator keeps the column slot.
+      // Device update overwrites every merged CSR value each step.
+      offdiag_conductance_[static_cast<std::size_t>(write)] = 1.0f;
+      ++write;
+    }
+  }
+
+  // Skew shares the same geometric cross stencil; merged GMRES CSR is built from
+  // the SPD pattern above. Keep skew buffers empty for the pattern path.
+  skew_row_offsets_.clear();
+  skew_col_indices_.clear();
+  skew_values_.clear();
+  skew_rhs_weight_.clear();
 }
 
 void PoissonWorld::build_operator() {

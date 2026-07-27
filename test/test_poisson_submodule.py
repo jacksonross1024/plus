@@ -184,6 +184,8 @@ class _FakeRawPoissonCudaSolver:
         ahe_ratio=0.0,
         picard_sweeps=2,
         picard_tolerance=0.0,
+        solver="pcg",
+        gmres_restart=50,
     ):
         impl = _FakeImpl(contact_potentials)
         impl.amr_enabled = bool(amr_enabled)
@@ -191,6 +193,8 @@ class _FakeRawPoissonCudaSolver:
         impl.amr_ratio = float(amr_ratio)
         impl.ahe_ratio = float(ahe_ratio)
         impl.picard_sweeps = int(picard_sweeps)
+        impl.solver = solver
+        impl.gmres_restart = int(gmres_restart)
         impl.transport_enabled = bool(amr_enabled or ahe_enabled)
         _FakeRawPoissonCudaSolver.last_transport = {
             "amr_enabled": impl.amr_enabled,
@@ -198,6 +202,8 @@ class _FakeRawPoissonCudaSolver:
             "amr_ratio": impl.amr_ratio,
             "ahe_ratio": impl.ahe_ratio,
             "picard_sweeps": impl.picard_sweeps,
+            "solver": impl.solver,
+            "gmres_restart": impl.gmres_restart,
         }
         return impl
 
@@ -230,6 +236,8 @@ class _FakeRawPoissonCudaSolver:
         ahe_ratio=0.0,
         picard_sweeps=2,
         picard_tolerance=0.0,
+        solver="pcg",
+        gmres_restart=50,
     ):
         _FakeRawPoissonCudaSolver.last_from_arrays = {
             "shape": (nz, ny, nx),
@@ -249,6 +257,8 @@ class _FakeRawPoissonCudaSolver:
         impl.amr_ratio = float(amr_ratio)
         impl.ahe_ratio = float(ahe_ratio)
         impl.picard_sweeps = int(picard_sweeps)
+        impl.solver = solver
+        impl.gmres_restart = int(gmres_restart)
         impl.transport_enabled = bool(amr_enabled or ahe_enabled)
         _FakeRawPoissonCudaSolver.last_transport = {
             "amr_enabled": impl.amr_enabled,
@@ -256,6 +266,8 @@ class _FakeRawPoissonCudaSolver:
             "amr_ratio": impl.amr_ratio,
             "ahe_ratio": impl.ahe_ratio,
             "picard_sweeps": impl.picard_sweeps,
+            "solver": impl.solver,
+            "gmres_restart": impl.gmres_restart,
         }
         return impl
 
@@ -504,8 +516,30 @@ def test_transport_defaults_off(fake_raw_solver):
     assert not solver.transport_enabled
     assert not solver.amr_enabled
     assert not solver.ahe_enabled
+    assert solver.solver == "gmres_cusparse"
     assert fake_raw_solver.last_transport["amr_enabled"] is False
     assert fake_raw_solver.last_transport["ahe_enabled"] is False
+
+
+def test_solver_option_forwards_to_native(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.zeros((1, 3)),
+        amr_enabled=True,
+        amr_ratio=0.1,
+        solver="gmres",
+        gmres_restart=24,
+    )
+    assert solver.solver == "gmres_cusparse"
+    assert fake_raw_solver.last_transport["solver"] == "gmres_cusparse"
+    assert fake_raw_solver.last_transport["gmres_restart"] == 24
+
+
+def test_solver_option_validation(fake_raw_solver):
+    with pytest.raises(ValueError, match="solver must be"):
+        poisson.CudaPoissonSolver(
+            contact_potentials=np.zeros((1, 3)),
+            solver="cg-but-not-this-one",
+        )
 
 
 def test_amr_ratio_requires_flag(fake_raw_solver):

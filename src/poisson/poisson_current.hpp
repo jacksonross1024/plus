@@ -38,6 +38,20 @@ struct StepStats {
   double picard_error = 0.0;
   int picard_sweeps_used = 0;
   double elapsed_s = 0.0;
+  double timing_total_s = 0.0;
+  double timing_device_magnetization_s = 0.0;
+  double timing_transport_s = 0.0;
+  double timing_magnetization_set_s = 0.0;
+  double timing_transport_rebuild_s = 0.0;
+  double timing_operator_upload_s = 0.0;
+  double timing_rhs_build_s = 0.0;
+  double timing_linear_solve_s = 0.0;
+  double timing_fill_phi_s = 0.0;
+  double timing_hall_s = 0.0;
+  double timing_j_raw_s = 0.0;
+  double timing_jcur_extract_s = 0.0;
+  double timing_jmod_postprocess_s = 0.0;
+  double timing_jmod_extract_s = 0.0;
   std::string stats_note;
 };
 

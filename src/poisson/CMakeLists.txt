@@ -3,6 +3,8 @@ add_library(poisson_native STATIC
     poisson_current.cpp
     signal_loader.cpp
     poisson_pcg_cuda.cu
+    poisson_gmres_cuda.cu
+    poisson_magnetization_cuda.cu
     poisson_cuda_session.cpp
 )
 
@@ -14,4 +16,4 @@ set_target_properties(poisson_native PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CUDA_SEPARABLE_COMPILATION ON
 )
-target_link_libraries(poisson_native PUBLIC CUDA::cudart CUDA::cublas)
+target_link_libraries(poisson_native PUBLIC CUDA::cudart CUDA::cublas CUDA::cusparse)

@@ -4,10 +4,16 @@
 #include <vector>
 
 #include "poisson_current.hpp"
+#include "poisson_gmres_cuda.hpp"
 #include "poisson_hall.hpp"
 #include "poisson_pcg_cuda.hpp"
 #include "poisson_world.hpp"
 #include "signal_loader.hpp"
+
+enum class PoissonLinearSolverKind {
+  kPcg,
+  kGmresCusparse,
+};
 
 class PoissonCudaSession {
  public:
@@ -21,7 +27,11 @@ class PoissonCudaSession {
                      const std::string& slice_z,
                      int cuda_tol_batch_first,
                      int cuda_tol_batch_next,
-                     TransportConfig transport = TransportConfig{});
+                     TransportConfig transport = TransportConfig{},
+                     PoissonLinearSolverKind solver_kind = PoissonLinearSolverKind::kPcg,
+                     int gmres_restart = 50);
+
+  ~PoissonCudaSession();
 
   PoissonCudaSession(const PoissonCudaSession&) = delete;
   PoissonCudaSession& operator=(const PoissonCudaSession&) = delete;
@@ -30,6 +40,16 @@ class PoissonCudaSession {
 
   StepStats iterate();
   StepStats iterate_with_magnetization(const std::vector<float>& magnetization_fm_stack);
+  StepStats iterate_with_magnetization_device(const float* d_mx,
+                                              const float* d_my,
+                                              const float* d_mz,
+                                              int src_nz,
+                                              int src_ny,
+                                              int src_nx,
+                                              const std::vector<int>& src_lo,
+                                              const std::vector<int>& src_hi,
+                                              const std::vector<float>& weight_hi,
+                                              bool average_z);
   void reset();
 
   int current_step() const { return step_; }
@@ -55,6 +75,7 @@ class PoissonCudaSession {
   double amr_ratio() const { return transport_config_.amr_ratio; }
   double ahe_ratio() const { return transport_config_.ahe_ratio; }
   int picard_sweeps() const { return transport_config_.picard_sweeps; }
+  PoissonLinearSolverKind solver_kind() const { return solver_kind_; }
 
   int out_nx() const { return output_spec_.out_nx(); }
   int out_ny() const { return output_spec_.out_ny(); }
@@ -74,13 +95,21 @@ class PoissonCudaSession {
   static void validate_contact_potentials(const PoissonWorld& world,
                                           const ContactPotentials& potentials);
   static int initial_max_iterations(int max_iterations);
-  StepStats iterate_impl(const std::vector<float>* magnetization_fm_stack);
+  StepStats iterate_impl(const std::vector<float>* magnetization_fm_stack,
+                         double timing_device_magnetization_s = 0.0);
+  StepStats finish_iterate_after_solve(StepStats stats,
+                                       const PcgResult& result,
+                                       double picard_error,
+                                       int picard_sweeps_used,
+                                       double elapsed_s);
 
   PoissonWorld world_;
   ContactPotentials potentials_;
   JmodOutputSpec output_spec_;
-  PoissonPcgCuda solver_;
+  PoissonPcgCuda pcg_solver_;
+  PoissonGmresCuda gmres_solver_;
   TransportConfig transport_config_;
+  PoissonLinearSolverKind solver_kind_ = PoissonLinearSolverKind::kPcg;
 
   double tolerance_ = 1e-5;
   int max_iterations_ = 2000;
@@ -109,4 +138,16 @@ class PoissonCudaSession {
 
   void update_hall_readout_from_phi();
   void clear_hall_readout_to_zeros();
+  void ensure_device_magnetization_mapping(const std::vector<int>& src_lo,
+                                           const std::vector<int>& src_hi,
+                                           const std::vector<float>& weight_hi,
+                                           bool average_z);
+
+  // Cached device mapping tables for iterate_with_magnetization_device (static geometry).
+  int* d_map_lo_ = nullptr;
+  int* d_map_hi_ = nullptr;
+  float* d_map_weight_ = nullptr;
+  int map_dst_nz_ = 0;
+  bool map_average_z_ = false;
+  bool map_tables_ready_ = false;
 };

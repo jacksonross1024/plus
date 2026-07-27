@@ -78,7 +78,10 @@ class PoissonWorld {
   int xy_index(int iy, int ix) const { return iy * meta_.nx + ix; }
 
   const std::vector<std::int8_t>& region() const { return region_; }
+  const std::vector<std::int8_t>& contact_id() const { return contact_id_; }
   const std::vector<float>& sigma() const { return sigma_; }
+  const std::vector<int>& unknown_index() const { return unknown_index_; }
+  const std::vector<int>& unknown_to_cell() const { return unknown_to_cell_; }
   const std::vector<int>& row_offsets() const { return row_offsets_; }
   const std::vector<int>& col_indices() const { return col_indices_; }
   const std::vector<float>& offdiag_conductance() const { return offdiag_conductance_; }
@@ -116,7 +119,11 @@ class PoissonWorld {
 
   void set_transport_config(TransportConfig config);
   void set_magnetization_fm_stack(const std::vector<float>& magnetization_mumax);
+  void refresh_transport_tensors();
   void rebuild_transport_operators();
+  /// Build maximal AMR/AHE CSR sparsity from geometry only (no m dependence).
+  /// Values are placeholders; GMRES device update overwrites them each step.
+  void build_transport_pattern_operators();
 
   void build_rhs(const std::vector<double>& potentials, std::vector<double>& rhs) const;
   void build_rhs_spd(const std::vector<double>& potentials, std::vector<double>& rhs) const;

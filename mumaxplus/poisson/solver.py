@@ -12,9 +12,10 @@ Grid extents follow :class:`~mumaxplus.Grid.shape`, i.e. ``(nz, ny, nx)``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple, Union
+import time
 import warnings
 
 import numpy as np
@@ -116,6 +117,25 @@ class PoissonStepStats:
     pcg_converged: bool = False
     picard_error: float = 0.0
     picard_sweeps_used: int = 0
+    timing_total_s: float = 0.0
+    timing_device_magnetization_s: float = 0.0
+    timing_transport_s: float = 0.0
+    timing_magnetization_set_s: float = 0.0
+    timing_transport_rebuild_s: float = 0.0
+    timing_operator_upload_s: float = 0.0
+    timing_rhs_build_s: float = 0.0
+    timing_linear_solve_s: float = 0.0
+    timing_fill_phi_s: float = 0.0
+    timing_hall_s: float = 0.0
+    timing_j_raw_s: float = 0.0
+    timing_jcur_extract_s: float = 0.0
+    timing_jmod_postprocess_s: float = 0.0
+    timing_jmod_extract_s: float = 0.0
+    timing_numpy_jmod_s: float = 0.0
+    timing_numpy_jcur_s: float = 0.0
+    timing_python_magnetization_s: float = 0.0
+    timing_native_call_s: float = 0.0
+    timing_python_output_map_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1120,6 +1140,24 @@ def _stats_from_dict(stats: Dict[str, Any]) -> PoissonStepStats:
         pcg_converged=bool(stats.get("pcg_converged", False)),
         picard_error=float(stats.get("picard_error", 0.0)),
         picard_sweeps_used=int(stats.get("picard_sweeps_used", 0)),
+        timing_total_s=float(stats.get("timing_total_s", 0.0)),
+        timing_device_magnetization_s=float(
+            stats.get("timing_device_magnetization_s", 0.0)
+        ),
+        timing_transport_s=float(stats.get("timing_transport_s", 0.0)),
+        timing_magnetization_set_s=float(stats.get("timing_magnetization_set_s", 0.0)),
+        timing_transport_rebuild_s=float(stats.get("timing_transport_rebuild_s", 0.0)),
+        timing_operator_upload_s=float(stats.get("timing_operator_upload_s", 0.0)),
+        timing_rhs_build_s=float(stats.get("timing_rhs_build_s", 0.0)),
+        timing_linear_solve_s=float(stats.get("timing_linear_solve_s", 0.0)),
+        timing_fill_phi_s=float(stats.get("timing_fill_phi_s", 0.0)),
+        timing_hall_s=float(stats.get("timing_hall_s", 0.0)),
+        timing_j_raw_s=float(stats.get("timing_j_raw_s", 0.0)),
+        timing_jcur_extract_s=float(stats.get("timing_jcur_extract_s", 0.0)),
+        timing_jmod_postprocess_s=float(stats.get("timing_jmod_postprocess_s", 0.0)),
+        timing_jmod_extract_s=float(stats.get("timing_jmod_extract_s", 0.0)),
+        timing_numpy_jmod_s=float(stats.get("timing_numpy_jmod_s", 0.0)),
+        timing_numpy_jcur_s=float(stats.get("timing_numpy_jcur_s", 0.0)),
     )
 
 
@@ -1140,6 +1178,15 @@ def _validate_transport_args(
         raise ValueError("ahe_ratio must be finite when AHE is enabled")
     if ahe_enabled and int(picard_sweeps) < 1:
         raise ValueError("picard_sweeps must be >= 1 when AHE is enabled")
+
+
+def _normalize_linear_solver(solver: str) -> str:
+    name = str(solver).strip().lower()
+    if name == "gmres":
+        name = "gmres_cusparse"
+    if name not in {"pcg", "gmres_cusparse"}:
+        raise ValueError("solver must be 'pcg' or 'gmres_cusparse'")
+    return name
 
 
 def _normalize_magnetization_frame(
@@ -1210,6 +1257,8 @@ class CudaPoissonSolver:
         ahe_ratio: float = 0.0,
         picard_sweeps: int = 2,
         picard_tolerance: float = 0.0,
+        solver: str = "gmres_cusparse",
+        gmres_restart: int = 50,
     ) -> None:
         potentials = _normalize_contact_potentials(contact_potentials)
         _validate_transport_args(
@@ -1238,6 +1287,10 @@ class CudaPoissonSolver:
         self._picard_sweeps = int(picard_sweeps)
         self._picard_tolerance = float(picard_tolerance)
         self._transport_enabled = bool(self._amr_enabled or self._ahe_enabled)
+        self._solver = _normalize_linear_solver(solver)
+        self._gmres_restart = int(gmres_restart)
+        if self._gmres_restart < 2:
+            raise ValueError("gmres_restart must be >= 2")
 
         transport_kwargs = {
             "amr_enabled": self._amr_enabled,
@@ -1246,6 +1299,8 @@ class CudaPoissonSolver:
             "ahe_ratio": self._ahe_ratio,
             "picard_sweeps": self._picard_sweeps,
             "picard_tolerance": self._picard_tolerance,
+            "solver": self._solver,
+            "gmres_restart": self._gmres_restart,
         }
 
         if world is None:
@@ -1327,6 +1382,8 @@ class CudaPoissonSolver:
         ahe_ratio: float = 0.0,
         picard_sweeps: int = 2,
         picard_tolerance: float = 0.0,
+        solver: str = "gmres_cusparse",
+        gmres_restart: int = 50,
     ) -> "CudaPoissonSolver":
         """Construct from a single-column signal file using C++ resampling rules."""
 
@@ -1351,6 +1408,10 @@ class CudaPoissonSolver:
         obj._picard_sweeps = int(picard_sweeps)
         obj._picard_tolerance = float(picard_tolerance)
         obj._transport_enabled = bool(obj._amr_enabled or obj._ahe_enabled)
+        obj._solver = _normalize_linear_solver(solver)
+        obj._gmres_restart = int(gmres_restart)
+        if obj._gmres_restart < 2:
+            raise ValueError("gmres_restart must be >= 2")
         obj._impl = _cpp.PoissonCudaSolver.from_signal_file(
             manifest,
             signal_path,
@@ -1372,6 +1433,8 @@ class CudaPoissonSolver:
             float(ahe_ratio),
             int(picard_sweeps),
             float(picard_tolerance),
+            obj._solver,
+            obj._gmres_restart,
         )
         obj._first_r2_layer = int(obj._impl.first_r2_layer)
         obj._configure_fm_export(
@@ -1544,6 +1607,12 @@ class CudaPoissonSolver:
     @property
     def picard_sweeps(self) -> int:
         return self._picard_sweeps
+
+    @property
+    def solver(self) -> str:
+        """Native linear solver backend: ``"pcg"`` or ``"gmres_cusparse"``."""
+
+        return self._solver
 
     def reset(self) -> None:
         """Restart from contact frame zero and clear the CUDA warm start."""
@@ -1775,6 +1844,80 @@ class CudaPoissonSolver:
                 out[:, iz, ...] = (1.0 - weight) * arr[:, lo, ...] + weight * arr[:, hi, ...]
         return np.ascontiguousarray(out, dtype=np.float32)
 
+    def _device_magnetization_mapping(
+        self,
+        source_nz: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+        """Return per-Poisson-layer device mapping arrays for native Variable input."""
+
+        n_fm = self.fm_layer_count
+        src_nz = int(source_nz)
+        cache_key = (
+            src_nz,
+            n_fm,
+            self._fm_export_mode,
+            self._fm_height,
+            tuple(self._fm_export_layers) if self._fm_export_layers is not None else None,
+        )
+        cached = getattr(self, "_device_mag_mapping_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        if src_nz <= 0:
+            raise ValueError("magnetization source nz must be > 0")
+
+        if src_nz < n_fm:
+            zeros_i = np.zeros(n_fm, dtype=np.int32)
+            zeros_f = np.zeros(n_fm, dtype=np.float32)
+            result = (zeros_i, zeros_i, zeros_f, True)
+        elif src_nz == n_fm:
+            idx = np.arange(n_fm, dtype=np.int32)
+            weight = np.zeros(n_fm, dtype=np.float32)
+            result = (idx, idx.copy(), weight, False)
+        elif self._fm_export_mode == "full":
+            raise ValueError(
+                f"magnetization nz={src_nz} does not match Poisson FM layers {n_fm}"
+            )
+        elif self._fm_export_mode == "layer":
+            layers = self._fm_export_layers
+            if src_nz != len(layers):
+                raise ValueError(
+                    f"magnetization nz={src_nz} does not match selected layers {layers}"
+                )
+            selected = sorted(set(layers))
+            lo = np.empty(n_fm, dtype=np.int32)
+            for layer in range(n_fm):
+                nearest = min(selected, key=lambda s: abs(s - layer))
+                lo[layer] = layers.index(nearest)
+            weight = np.zeros(n_fm, dtype=np.float32)
+            result = (lo, lo.copy(), weight, False)
+        else:
+            if self._fm_height is None:
+                raise RuntimeError("height export is missing fm_height")
+            lo = np.empty(n_fm, dtype=np.int32)
+            hi = np.empty(n_fm, dtype=np.int32)
+            weight = np.empty(n_fm, dtype=np.float32)
+            fm_cz = self._fm_height / max(src_nz, 1)
+            poisson_cz = self.cellsize[2]
+            for iz in range(n_fm):
+                z_mid = (iz + 0.5) * poisson_cz
+                pos = z_mid / max(fm_cz, 1e-30) - 0.5
+                if pos <= 0.0:
+                    lo[iz] = hi[iz] = 0
+                    weight[iz] = 0.0
+                elif pos >= src_nz - 1:
+                    lo[iz] = hi[iz] = src_nz - 1
+                    weight[iz] = 0.0
+                else:
+                    lo_i = int(np.floor(pos))
+                    lo[iz] = lo_i
+                    hi[iz] = lo_i + 1
+                    weight[iz] = np.float32(pos - lo_i)
+            result = (lo, hi, weight, False)
+
+        self._device_mag_mapping_cache = (cache_key, result)
+        return result
+
     def _map_fm_export(self, frame: np.ndarray) -> np.ndarray:
         arr = _as_mumax_vector_frame(frame)
         _, ny, nx = arr.shape[1:]
@@ -1823,23 +1966,74 @@ class CudaPoissonSolver:
             mutate previously returned arrays.
         """
 
+        timing_python_magnetization_s = 0.0
+        timing_native_call_s = 0.0
         if self._transport_enabled:
             if magnetization is not None:
-                m_export = _normalize_magnetization_frame(
-                    magnetization, self.output_shape[1:]
-                )
-                m_stack = self._map_magnetization_to_poisson_fm_stack(m_export)
-                raw = self._impl.iterate_with_magnetization(m_stack)
+                from mumaxplus.variable import Variable
+
+                t_mag0 = time.perf_counter()
+                if isinstance(magnetization, Variable) and hasattr(
+                    self._impl, "iterate_with_magnetization_variable"
+                ):
+                    shape = tuple(int(v) for v in getattr(magnetization, "shape"))
+                    if len(shape) != 4 or shape[0] != 3:
+                        raise ValueError(
+                            f"magnetization shape {shape} is invalid; expected "
+                            "(3, nz, ny, nx)"
+                        )
+                    if shape[2:] != self.output_shape[2:]:
+                        raise ValueError(
+                            f"magnetization xy shape {shape[2:]} does not match Poisson "
+                            f"xy shape {self.output_shape[2:]}"
+                        )
+                    src_lo, src_hi, weight_hi, average_z = self._device_magnetization_mapping(
+                        shape[1]
+                    )
+                    timing_python_magnetization_s = time.perf_counter() - t_mag0
+                    t_native0 = time.perf_counter()
+                    raw = self._impl.iterate_with_magnetization_variable(
+                        magnetization._impl,
+                        src_lo,
+                        src_hi,
+                        weight_hi,
+                        average_z,
+                    )
+                    timing_native_call_s = time.perf_counter() - t_native0
+                else:
+                    m_export = _normalize_magnetization_frame(
+                        magnetization, self.output_shape[1:]
+                    )
+                    m_stack = self._map_magnetization_to_poisson_fm_stack(m_export)
+                    timing_python_magnetization_s = time.perf_counter() - t_mag0
+                    t_native0 = time.perf_counter()
+                    raw = self._impl.iterate_with_magnetization(m_stack)
+                    timing_native_call_s = time.perf_counter() - t_native0
             else:
                 # Allow skipped near-zero frames without magnetization; C++ raises
                 # if the frame is not skipped and transport is enabled.
+                t_native0 = time.perf_counter()
                 raw = self._impl.iterate()
+                timing_native_call_s = time.perf_counter() - t_native0
         else:
+            t_native0 = time.perf_counter()
             raw = self._impl.iterate()
+            timing_native_call_s = time.perf_counter() - t_native0
+        t_out0 = time.perf_counter()
+        jmod = self._map_fm_export(raw["jmod"])
+        jcur = self._map_fm_export(raw["jcur"])
+        timing_python_output_map_s = time.perf_counter() - t_out0
+        stats = _stats_from_dict(raw["stats"])
+        stats = replace(
+            stats,
+            timing_python_magnetization_s=timing_python_magnetization_s,
+            timing_native_call_s=timing_native_call_s,
+            timing_python_output_map_s=timing_python_output_map_s,
+        )
         return PoissonStepResult(
-            jmod=self._map_fm_export(raw["jmod"]),
-            jcur=self._map_fm_export(raw["jcur"]),
-            stats=_stats_from_dict(raw["stats"]),
+            jmod=jmod,
+            jcur=jcur,
+            stats=stats,
         )
 
     def check_compatible(

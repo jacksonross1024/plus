@@ -1,5 +1,6 @@
 #include "wrappers.hpp"
 
+#include <chrono>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -9,7 +10,9 @@
 #include <utility>
 #include <vector>
 
+#include "field.hpp"
 #include "poisson_cuda_session.hpp"
+#include "variable.hpp"
 
 namespace {
 
@@ -83,6 +86,38 @@ TransportConfig transport_from_args(bool amr_enabled,
   return cfg;
 }
 
+PoissonLinearSolverKind solver_kind_from_string(const std::string& solver) {
+  if (solver == "pcg") {
+    return PoissonLinearSolverKind::kPcg;
+  }
+  if (solver == "gmres" || solver == "gmres_cusparse") {
+    return PoissonLinearSolverKind::kGmresCusparse;
+  }
+  throw std::invalid_argument("poisson solver must be 'pcg' or 'gmres_cusparse'");
+}
+
+std::string solver_kind_to_string(PoissonLinearSolverKind solver) {
+  switch (solver) {
+    case PoissonLinearSolverKind::kPcg:
+      return "pcg";
+    case PoissonLinearSolverKind::kGmresCusparse:
+      return "gmres_cusparse";
+  }
+  return "unknown";
+}
+
+template <typename T>
+std::vector<T> vector_from_1d_array(py::array_t<T, py::array::c_style | py::array::forcecast> array,
+                                    int n,
+                                    const char* name) {
+  const py::buffer_info info = array.request();
+  if (info.ndim != 1 || info.shape[0] != n) {
+    throw std::invalid_argument(std::string(name) + " must have shape (n_fm,)");
+  }
+  const auto* data = static_cast<const T*>(info.ptr);
+  return std::vector<T>(data, data + n);
+}
+
 /// Internal Poisson buffers use ``(nz, ny, nx, 3)``; mumax+ uses ``(3, nz, ny, nx)``.
 py::array_t<float> frame_to_numpy_mumax_copy(const std::vector<float>& frame, int nz, int ny,
                                              int nx) {
@@ -123,6 +158,20 @@ py::dict stats_to_dict(const StepStats& stats) {
   out["picard_error"] = stats.picard_error;
   out["picard_sweeps_used"] = stats.picard_sweeps_used;
   out["elapsed_s"] = stats.elapsed_s;
+  out["timing_total_s"] = stats.timing_total_s;
+  out["timing_device_magnetization_s"] = stats.timing_device_magnetization_s;
+  out["timing_transport_s"] = stats.timing_transport_s;
+  out["timing_magnetization_set_s"] = stats.timing_magnetization_set_s;
+  out["timing_transport_rebuild_s"] = stats.timing_transport_rebuild_s;
+  out["timing_operator_upload_s"] = stats.timing_operator_upload_s;
+  out["timing_rhs_build_s"] = stats.timing_rhs_build_s;
+  out["timing_linear_solve_s"] = stats.timing_linear_solve_s;
+  out["timing_fill_phi_s"] = stats.timing_fill_phi_s;
+  out["timing_hall_s"] = stats.timing_hall_s;
+  out["timing_j_raw_s"] = stats.timing_j_raw_s;
+  out["timing_jcur_extract_s"] = stats.timing_jcur_extract_s;
+  out["timing_jmod_postprocess_s"] = stats.timing_jmod_postprocess_s;
+  out["timing_jmod_extract_s"] = stats.timing_jmod_extract_s;
   out["note"] = stats.stats_note;
   return out;
 }
@@ -189,11 +238,17 @@ py::dict iterate_to_dict(PoissonCudaSession& session) {
   }
 
   py::dict out;
+  const auto t_jmod0 = std::chrono::steady_clock::now();
   out["jmod"] = frame_to_numpy_mumax_copy(session.jmod_frame(), session.out_nz(), session.out_ny(),
                                           session.out_nx());
+  const auto t_jmod1 = std::chrono::steady_clock::now();
   out["jcur"] = frame_to_numpy_mumax_copy(session.jcur_frame(), session.out_nz(), session.out_ny(),
                                           session.out_nx());
-  out["stats"] = stats_to_dict(stats);
+  const auto t_jcur1 = std::chrono::steady_clock::now();
+  py::dict stats_dict = stats_to_dict(stats);
+  stats_dict["timing_numpy_jmod_s"] = std::chrono::duration<double>(t_jmod1 - t_jmod0).count();
+  stats_dict["timing_numpy_jcur_s"] = std::chrono::duration<double>(t_jcur1 - t_jmod1).count();
+  out["stats"] = stats_dict;
   return out;
 }
 
@@ -208,11 +263,65 @@ py::dict iterate_with_magnetization_to_dict(
   }
 
   py::dict out;
+  const auto t_jmod0 = std::chrono::steady_clock::now();
   out["jmod"] = frame_to_numpy_mumax_copy(session.jmod_frame(), session.out_nz(), session.out_ny(),
                                           session.out_nx());
+  const auto t_jmod1 = std::chrono::steady_clock::now();
   out["jcur"] = frame_to_numpy_mumax_copy(session.jcur_frame(), session.out_nz(), session.out_ny(),
                                           session.out_nx());
-  out["stats"] = stats_to_dict(stats);
+  const auto t_jcur1 = std::chrono::steady_clock::now();
+  py::dict stats_dict = stats_to_dict(stats);
+  stats_dict["timing_numpy_jmod_s"] = std::chrono::duration<double>(t_jmod1 - t_jmod0).count();
+  stats_dict["timing_numpy_jcur_s"] = std::chrono::duration<double>(t_jcur1 - t_jmod1).count();
+  out["stats"] = stats_dict;
+  return out;
+}
+
+py::dict iterate_with_magnetization_variable_to_dict(
+    PoissonCudaSession& session,
+    const Variable& magnetization,
+    py::array_t<int, py::array::c_style | py::array::forcecast> src_lo,
+    py::array_t<int, py::array::c_style | py::array::forcecast> src_hi,
+    py::array_t<float, py::array::c_style | py::array::forcecast> weight_hi,
+    bool average_z) {
+  const Field& field = magnetization.field();
+  if (field.ncomp() != 3) {
+    throw std::invalid_argument("magnetization variable must have 3 components");
+  }
+  const int3 size = field.grid().size();
+  if (size.y != session.ny() || size.x != session.nx()) {
+    throw std::invalid_argument("magnetization variable xy shape does not match Poisson world");
+  }
+  const int n_fm = session.fm_layer_count();
+  std::vector<int> lo = vector_from_1d_array<int>(src_lo, n_fm, "src_lo");
+  std::vector<int> hi = vector_from_1d_array<int>(src_hi, n_fm, "src_hi");
+  std::vector<float> wh = vector_from_1d_array<float>(weight_hi, n_fm, "weight_hi");
+
+  StepStats stats;
+  {
+    py::gil_scoped_release release;
+#if FP_PRECISION == SINGLE
+    stats = session.iterate_with_magnetization_device(field.device_ptr(0), field.device_ptr(1),
+                                                      field.device_ptr(2), size.z, size.y, size.x,
+                                                      lo, hi, wh, average_z);
+#else
+    throw std::runtime_error(
+        "device magnetization Poisson path requires single-precision mumax+ fields");
+#endif
+  }
+
+  py::dict out;
+  const auto t_jmod0 = std::chrono::steady_clock::now();
+  out["jmod"] = frame_to_numpy_mumax_copy(session.jmod_frame(), session.out_nz(), session.out_ny(),
+                                          session.out_nx());
+  const auto t_jmod1 = std::chrono::steady_clock::now();
+  out["jcur"] = frame_to_numpy_mumax_copy(session.jcur_frame(), session.out_nz(), session.out_ny(),
+                                          session.out_nx());
+  const auto t_jcur1 = std::chrono::steady_clock::now();
+  py::dict stats_dict = stats_to_dict(stats);
+  stats_dict["timing_numpy_jmod_s"] = std::chrono::duration<double>(t_jmod1 - t_jmod0).count();
+  stats_dict["timing_numpy_jcur_s"] = std::chrono::duration<double>(t_jcur1 - t_jmod1).count();
+  out["stats"] = stats_dict;
   return out;
 }
 
@@ -237,13 +346,16 @@ void wrap_poisson_cuda(py::module& m) {
              bool ahe_enabled,
              double ahe_ratio,
              int picard_sweeps,
-             double picard_tolerance) {
+             double picard_tolerance,
+             const std::string& solver,
+             int gmres_restart) {
             return std::make_unique<PoissonCudaSession>(
                 PoissonWorld::load(manifest_path), contact_potentials_from_array(potentials_array),
                 tolerance, max_iterations, skip_threshold, slice_x, slice_y, slice_z,
                 cuda_tol_batch_first, cuda_tol_batch_next,
                 transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps,
-                                    picard_tolerance));
+                                    picard_tolerance),
+                solver_kind_from_string(solver), gmres_restart);
           },
           py::arg("manifest_path"),
           py::arg("contact_potentials"),
@@ -260,7 +372,9 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("ahe_enabled") = false,
           py::arg("ahe_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
-          py::arg("picard_tolerance") = 0.0)
+          py::arg("picard_tolerance") = 0.0,
+          py::arg("solver") = "gmres_cusparse",
+          py::arg("gmres_restart") = 50)
       .def_static(
           "from_arrays",
           [](int nx,
@@ -289,7 +403,9 @@ void wrap_poisson_cuda(py::module& m) {
              bool ahe_enabled,
              double ahe_ratio,
              int picard_sweeps,
-             double picard_tolerance) {
+             double picard_tolerance,
+             const std::string& solver,
+             int gmres_restart) {
             ManifestData meta;
             meta.nx = nx;
             meta.ny = ny;
@@ -311,7 +427,8 @@ void wrap_poisson_cuda(py::module& m) {
                 max_iterations, skip_threshold, slice_x, slice_y, slice_z, cuda_tol_batch_first,
                 cuda_tol_batch_next,
                 transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps,
-                                    picard_tolerance));
+                                    picard_tolerance),
+                solver_kind_from_string(solver), gmres_restart);
           },
           py::arg("nx"),
           py::arg("ny"),
@@ -339,7 +456,9 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("ahe_enabled") = false,
           py::arg("ahe_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
-          py::arg("picard_tolerance") = 0.0)
+          py::arg("picard_tolerance") = 0.0,
+          py::arg("solver") = "gmres_cusparse",
+          py::arg("gmres_restart") = 50)
       .def_static(
           "from_signal_file",
           [](const std::string& manifest_path,
@@ -361,7 +480,9 @@ void wrap_poisson_cuda(py::module& m) {
              bool ahe_enabled,
              double ahe_ratio,
              int picard_sweeps,
-             double picard_tolerance) {
+             double picard_tolerance,
+             const std::string& solver,
+             int gmres_restart) {
             return std::make_unique<PoissonCudaSession>(
                 PoissonWorld::load(manifest_path),
                 load_signal_file_to_contact_potentials(signal_path, nt, v_scale, skip_first,
@@ -369,7 +490,8 @@ void wrap_poisson_cuda(py::module& m) {
                 tolerance, max_iterations, skip_threshold, slice_x, slice_y, slice_z,
                 cuda_tol_batch_first, cuda_tol_batch_next,
                 transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps,
-                                    picard_tolerance));
+                                    picard_tolerance),
+                solver_kind_from_string(solver), gmres_restart);
           },
           py::arg("manifest_path"),
           py::arg("signal_path"),
@@ -390,10 +512,18 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("ahe_enabled") = false,
           py::arg("ahe_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
-          py::arg("picard_tolerance") = 0.0)
+          py::arg("picard_tolerance") = 0.0,
+          py::arg("solver") = "gmres_cusparse",
+          py::arg("gmres_restart") = 50)
       .def("iterate", &iterate_to_dict)
       .def("iterate_with_magnetization", &iterate_with_magnetization_to_dict,
            py::arg("magnetization"))
+      .def("iterate_with_magnetization_variable", &iterate_with_magnetization_variable_to_dict,
+           py::arg("magnetization"),
+           py::arg("src_lo"),
+           py::arg("src_hi"),
+           py::arg("weight_hi"),
+           py::arg("average_z") = false)
       .def("reset", &PoissonCudaSession::reset)
       .def(
           "set_hall_probe_indices",
@@ -426,6 +556,10 @@ void wrap_poisson_cuda(py::module& m) {
       .def_property_readonly("amr_ratio", &PoissonCudaSession::amr_ratio)
       .def_property_readonly("ahe_ratio", &PoissonCudaSession::ahe_ratio)
       .def_property_readonly("picard_sweeps", &PoissonCudaSession::picard_sweeps)
+      .def_property_readonly("solver",
+                             [](const PoissonCudaSession& s) {
+                               return solver_kind_to_string(s.solver_kind());
+                             })
       .def_property_readonly("fm_layer_count", &PoissonCudaSession::fm_layer_count)
       .def_property_readonly("world_shape",
                              [](const PoissonCudaSession& s) {
