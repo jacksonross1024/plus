@@ -173,6 +173,133 @@ __device__ SymTensor6D d_sym_tensor_for_cell(int cell,
           static_cast<float>(-base_s * q * static_cast<double>(my) * mz)};
 }
 
+struct Vec3fD {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+};
+
+__device__ Vec3fD d_cross(Vec3fD a, Vec3fD b) {
+  return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+__device__ float d_dot(Vec3fD a, Vec3fD b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+__device__ void d_load_vector_fm_stack(float& vx,
+                                       float& vy,
+                                       float& vz,
+                                       int fm_layer,
+                                       int xy,
+                                       int n_fm,
+                                       int plane,
+                                       const float* field) {
+  const std::size_t n_xy = static_cast<std::size_t>(n_fm) * static_cast<std::size_t>(plane);
+  const std::size_t base =
+      static_cast<std::size_t>(fm_layer) * static_cast<std::size_t>(plane) +
+      static_cast<std::size_t>(xy);
+  vx = field[base];
+  vy = field[n_xy + base];
+  vz = field[2u * n_xy + base];
+}
+
+__device__ bool d_load_unit_m_if_valid(Vec3fD& m,
+                                       int fm_layer,
+                                       int iy,
+                                       int ix,
+                                       int nx,
+                                       int ny,
+                                       int n_fm,
+                                       int first_r2_layer,
+                                       const signed char* region,
+                                       const float* sigma,
+                                       const float* magnetization) {
+  if (fm_layer < 0 || fm_layer >= n_fm || ix < 0 || ix >= nx || iy < 0 || iy >= ny) {
+    return false;
+  }
+  const int iz = fm_layer + first_r2_layer;
+  const int cell = d_flat_index(iz, iy, ix, ny, nx);
+  if (!d_uses_magnetization(region, sigma, cell)) {
+    return false;
+  }
+  float mx = 0.0f;
+  float my = 0.0f;
+  float mz = 0.0f;
+  d_load_magnetization_fm_stack(mx, my, mz, fm_layer, iy * nx + ix, n_fm, nx * ny, magnetization);
+  if (mx == 0.0f && my == 0.0f && mz == 0.0f) {
+    return false;
+  }
+  m = {mx, my, mz};
+  return true;
+}
+
+__device__ Vec3fD d_central_dm(int fm_layer,
+                              int iy,
+                              int ix,
+                              int dfm,
+                              int diy,
+                              int dix,
+                              int nx,
+                              int ny,
+                              int n_fm,
+                              int first_r2_layer,
+                              const signed char* region,
+                              const float* sigma,
+                              const float* magnetization) {
+  Vec3fD plus;
+  Vec3fD minus;
+  if (!d_load_unit_m_if_valid(plus, fm_layer + dfm, iy + diy, ix + dix, nx, ny, n_fm,
+                             first_r2_layer, region, sigma, magnetization) ||
+      !d_load_unit_m_if_valid(minus, fm_layer - dfm, iy - diy, ix - dix, nx, ny, n_fm,
+                             first_r2_layer, region, sigma, magnetization)) {
+    return {};
+  }
+  return {0.5f * (plus.x - minus.x), 0.5f * (plus.y - minus.y), 0.5f * (plus.z - minus.z)};
+}
+
+__global__ void k_winding(int n_fm,
+                          int nx,
+                          int ny,
+                          int first_r2_layer,
+                          const signed char* region,
+                          const float* sigma,
+                          const float* magnetization,
+                          float* winding) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = nx * ny;
+  const int total = n_fm * plane;
+  if (idx >= total) {
+    return;
+  }
+  const std::size_t n_xy = static_cast<std::size_t>(total);
+  winding[idx] = 0.0f;
+  winding[n_xy + static_cast<std::size_t>(idx)] = 0.0f;
+  winding[2u * n_xy + static_cast<std::size_t>(idx)] = 0.0f;
+
+  const int fm_layer = idx / plane;
+  const int xy = idx - fm_layer * plane;
+  const int iy = xy / nx;
+  const int ix = xy - iy * nx;
+  Vec3fD m;
+  if (!d_load_unit_m_if_valid(m, fm_layer, iy, ix, nx, ny, n_fm, first_r2_layer, region, sigma,
+                             magnetization)) {
+    return;
+  }
+  const Vec3fD dmx = d_central_dm(fm_layer, iy, ix, 0, 0, 1, nx, ny, n_fm, first_r2_layer, region,
+                                  sigma, magnetization);
+  const Vec3fD dmy = d_central_dm(fm_layer, iy, ix, 0, 1, 0, nx, ny, n_fm, first_r2_layer, region,
+                                  sigma, magnetization);
+  const Vec3fD dmz = d_central_dm(fm_layer, iy, ix, 1, 0, 0, nx, ny, n_fm, first_r2_layer, region,
+                                  sigma, magnetization);
+  // Φ₀-consistent 3D winding (no Levi-Civita double count). δα m is the
+  // dimensionless central difference; missing FM/void/Pt/edge neighbors contribute 0.
+  const float hx = d_dot(m, d_cross(dmy, dmz));
+  const float hy = d_dot(m, d_cross(dmz, dmx));
+  const float hz = d_dot(m, d_cross(dmx, dmy));
+  winding[idx] = hx;
+  winding[n_xy + static_cast<std::size_t>(idx)] = hy;
+  winding[2u * n_xy + static_cast<std::size_t>(idx)] = hz;
+}
+
 __device__ SkewTensor3D d_skew_tensor_for_cell(int cell,
                                               const signed char* region,
                                               const float* sigma,
@@ -182,8 +309,11 @@ __device__ SkewTensor3D d_skew_tensor_for_cell(int cell,
                                               int n_fm,
                                               bool ahe_enabled,
                                               double ahe_ratio,
-                                              const float* magnetization) {
-  if (!ahe_enabled || !d_uses_magnetization(region, sigma, cell)) {
+                                              bool the_enabled,
+                                              double the_ratio,
+                                              const float* magnetization,
+                                              const float* winding) {
+  if ((!ahe_enabled && !the_enabled) || !d_uses_magnetization(region, sigma, cell)) {
     return {};
   }
   const int plane = nx * ny;
@@ -192,15 +322,30 @@ __device__ SkewTensor3D d_skew_tensor_for_cell(int cell,
   const int iy = rem / nx;
   const int ix = rem - iy * nx;
   const int fm_layer = iz - first_r2_layer;
-  float mx = 0.0f;
-  float my = 0.0f;
-  float mz = 0.0f;
-  d_load_magnetization_fm_stack(mx, my, mz, fm_layer, iy * nx + ix, n_fm, plane, magnetization);
-  if (mx == 0.0f && my == 0.0f && mz == 0.0f) {
-    return {};
+  SkewTensor3D k{};
+  if (ahe_enabled) {
+    float mx = 0.0f;
+    float my = 0.0f;
+    float mz = 0.0f;
+    d_load_magnetization_fm_stack(mx, my, mz, fm_layer, iy * nx + ix, n_fm, plane, magnetization);
+    if (!(mx == 0.0f && my == 0.0f && mz == 0.0f)) {
+      const float sigma_ahe = static_cast<float>(ahe_ratio * static_cast<double>(sigma[cell]));
+      k.xy += -sigma_ahe * mz;
+      k.xz += sigma_ahe * my;
+      k.yz += -sigma_ahe * mx;
+    }
   }
-  const float sigma_ahe = static_cast<float>(ahe_ratio * static_cast<double>(sigma[cell]));
-  return {-sigma_ahe * mz, sigma_ahe * my, -sigma_ahe * mx};
+  if (the_enabled && winding != nullptr) {
+    float hx = 0.0f;
+    float hy = 0.0f;
+    float hz = 0.0f;
+    d_load_vector_fm_stack(hx, hy, hz, fm_layer, iy * nx + ix, n_fm, plane, winding);
+    const float sigma_the = static_cast<float>(the_ratio * static_cast<double>(sigma[cell]));
+    k.xy += -sigma_the * hz;
+    k.xz += sigma_the * hy;
+    k.yz += -sigma_the * hx;
+  }
+  return k;
 }
 
 __device__ float d_avg_diag(float a, float b) {
@@ -468,7 +613,10 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
                                                   double amr_ratio,
                                                   bool ahe_enabled,
                                                   double ahe_ratio,
+                                                  bool the_enabled,
+                                                  double the_ratio,
                                                   const float* magnetization,
+                                                  const float* winding,
                                                   const signed char* region,
                                                   const signed char* contact_id,
                                                   const float* sigma,
@@ -499,7 +647,8 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
   const SymTensor6D s0 = d_sym_tensor_for_cell(cell, region, sigma, nx, ny, first_r2_layer, n_fm,
                                                amr_enabled, amr_ratio, magnetization);
   const SkewTensor3D k0 = d_skew_tensor_for_cell(cell, region, sigma, nx, ny, first_r2_layer, n_fm,
-                                                 ahe_enabled, ahe_ratio, magnetization);
+                                                 ahe_enabled, ahe_ratio, the_enabled, the_ratio,
+                                                 magnetization, winding);
 
   double rhs = 0.0;
   double diag = 0.0;
@@ -521,7 +670,8 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
     const SymTensor6D s1 = d_sym_tensor_for_cell(nbr, region, sigma, nx, ny, first_r2_layer, n_fm,
                                                  amr_enabled, amr_ratio, magnetization);
     const SkewTensor3D k1 = d_skew_tensor_for_cell(nbr, region, sigma, nx, ny, first_r2_layer, n_fm,
-                                                   ahe_enabled, ahe_ratio, magnetization);
+                                                   ahe_enabled, ahe_ratio, the_enabled, the_ratio,
+                                                   magnetization, winding);
 
     float face_diag = 0.0f;
     if (axis == 0) {
@@ -546,7 +696,7 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
     d_add_cross_terms(row, cell, nbr, axis, sym_xy, sym_xz, sym_yz, nx, ny, nz, cx, cy, cz,
                       sigma, unknown_index, contact_id, potentials, row_off, col_idx, val, rhs,
                       diag, fail, false);
-    if (ahe_enabled) {
+    if (ahe_enabled || the_enabled) {
       const float skew_xy = d_avg_signed(k0.xy, k1.xy);
       const float skew_xz = d_avg_signed(k0.xz, k1.xz);
       const float skew_yz = d_avg_signed(k0.yz, k1.yz);
@@ -692,6 +842,7 @@ PoissonGmresCuda::~PoissonGmresCuda() {
   cudaFree(d_contact_id_);
   cudaFree(d_sigma_);
   cudaFree(d_magnetization_);
+  cudaFree(d_h_);
   cudaFree(d_contact_potentials_);
   cudaFree(d_update_fail_);
   cudaFree(d_x_);
@@ -869,9 +1020,11 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
   cz_ = world.cz();
   amr_enabled_ = world.amr_enabled();
   ahe_enabled_ = world.ahe_enabled();
+  the_enabled_ = world.the_enabled();
   const TransportConfig& config = world.transport_config();
   amr_ratio_ = config.amr_ratio;
   ahe_ratio_ = config.ahe_ratio;
+  the_ratio_ = config.the_ratio;
 
   // One-time geometry check: region==2 cells must map into the FM magnetization stack.
   const int plane = nx_ * ny_;
@@ -895,6 +1048,7 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
   cudaFree(d_contact_id_);
   cudaFree(d_sigma_);
   cudaFree(d_magnetization_);
+  cudaFree(d_h_);
   cudaFree(d_contact_potentials_);
   cudaFree(d_update_fail_);
   d_unknown_index_ = nullptr;
@@ -903,6 +1057,7 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
   d_contact_id_ = nullptr;
   d_sigma_ = nullptr;
   d_magnetization_ = nullptr;
+  d_h_ = nullptr;
   d_contact_potentials_ = nullptr;
   d_update_fail_ = nullptr;
 
@@ -921,6 +1076,9 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
              "cudaMalloc gmres sigma");
   check_cuda(cudaMalloc(&d_magnetization_, mag_values * sizeof(float)),
              "cudaMalloc gmres magnetization");
+  if (the_enabled_) {
+    check_cuda(cudaMalloc(&d_h_, mag_values * sizeof(float)), "cudaMalloc gmres winding");
+  }
   check_cuda(
       cudaMalloc(&d_contact_potentials_, static_cast<std::size_t>(num_contacts_) * sizeof(double)),
       "cudaMalloc gmres contact potentials");
@@ -962,12 +1120,24 @@ void PoissonGmresCuda::update_transport_operator_and_rhs_device(
              "cudaMemcpy gmres contact potentials");
   check_cuda(cudaMemset(d_update_fail_, 0, sizeof(int)), "cudaMemset gmres update fail");
 
+  if (the_enabled_) {
+    if (d_h_ == nullptr || d_magnetization_ == nullptr) {
+      throw std::runtime_error("GMRES THE winding buffer is not prepared");
+    }
+    const int plane = nx_ * ny_;
+    const int total = fm_layer_count_ * plane;
+    const int wblocks = (total + threads_per_block() - 1) / threads_per_block();
+    k_winding<<<wblocks, threads_per_block()>>>(fm_layer_count_, nx_, ny_, first_r2_layer_,
+                                                d_region_, d_sigma_, d_magnetization_, d_h_);
+    check_cuda(cudaGetLastError(), "k_winding launch");
+  }
+
   const int blocks = (n_ + threads_per_block() - 1) / threads_per_block();
   k_update_transport_matrix_and_rhs<<<blocks, threads_per_block()>>>(
       n_, nx_, ny_, nz_, first_r2_layer_, fm_layer_count_, cx_, cy_, cz_, amr_enabled_,
-      amr_ratio_, ahe_enabled_, ahe_ratio_, d_magnetization_, d_region_, d_contact_id_, d_sigma_,
-      d_unknown_index_, d_unknown_to_cell_, d_row_off_, d_col_idx_, d_contact_potentials_, d_val_,
-      d_diag_, d_inv_diag_, d_rhs_, d_update_fail_);
+      amr_ratio_, ahe_enabled_, ahe_ratio_, the_enabled_, the_ratio_, d_magnetization_, d_h_,
+      d_region_, d_contact_id_, d_sigma_, d_unknown_index_, d_unknown_to_cell_, d_row_off_,
+      d_col_idx_, d_contact_potentials_, d_val_, d_diag_, d_inv_diag_, d_rhs_, d_update_fail_);
   check_cuda(cudaGetLastError(), "k_update_transport_matrix_and_rhs launch");
   int failed = 0;
   check_cuda(cudaMemcpy(&failed, d_update_fail_, sizeof(int), cudaMemcpyDeviceToHost),

@@ -292,7 +292,7 @@ StepStats PoissonCudaSession::iterate_with_magnetization_device(
     gmres_solver_.copy_magnetization_device_to_host(magnetization_fm_stack);
     stats.timing_device_magnetization_s = seconds_between(t_map0, Clock::now());
 
-    // Host tensors required for CPU jmod/jcur extraction (AMR/AHE Ohm's law).
+    // Host tensors required for CPU jmod/jcur extraction (AMR/AHE/THE Ohm's law).
     const auto t_mset0 = Clock::now();
     world_.set_magnetization_fm_stack(magnetization_fm_stack);
     world_.refresh_transport_tensors();
@@ -360,7 +360,7 @@ StepStats PoissonCudaSession::iterate_impl(const std::vector<float>* magnetizati
     const auto t_transport0 = Clock::now();
     if (magnetization_fm_stack == nullptr) {
       throw std::runtime_error(
-          "PoissonCudaSession: magnetization is required when AMR/AHE transport is enabled");
+          "PoissonCudaSession: magnetization is required when AMR/AHE/THE transport is enabled");
     }
     const auto t_mset0 = Clock::now();
     world_.set_magnetization_fm_stack(*magnetization_fm_stack);
@@ -406,7 +406,7 @@ StepStats PoissonCudaSession::iterate_impl(const std::vector<float>* magnetizati
       gmres_solver_.upload_transport_operator(world_);
     } else {
       pcg_solver_.upload_spd_operator(world_);
-      if (world_.ahe_enabled()) {
+      if (world_.skew_enabled()) {
         pcg_solver_.upload_skew_operator(world_);
       } else {
         pcg_solver_.clear_skew_operator();
@@ -431,7 +431,7 @@ StepStats PoissonCudaSession::iterate_impl(const std::vector<float>* magnetizati
   if (world_.transport_enabled() && solver_kind_ == PoissonLinearSolverKind::kGmresCusparse) {
     const auto t_rhs0 = Clock::now();
     world_.build_rhs_spd(applied_, rhs_);
-    if (world_.ahe_enabled()) {
+    if (world_.skew_enabled()) {
       world_.build_rhs_skew(applied_, rhs_k_);
       for (std::size_t i = 0; i < rhs_.size(); ++i) {
         rhs_[i] += rhs_k_[i];
@@ -442,7 +442,7 @@ StepStats PoissonCudaSession::iterate_impl(const std::vector<float>* magnetizati
     result = gmres_solver_.solve(rhs_, x_);
     stats.timing_linear_solve_s = seconds_between(t_solve0, Clock::now());
     stats.stats_note = "gmres_cusparse_jacobi err=" + std::to_string(result.residual_relative);
-  } else if (world_.transport_enabled() && world_.ahe_enabled()) {
+  } else if (world_.transport_enabled() && world_.skew_enabled()) {
     const auto t_rhs0 = Clock::now();
     world_.build_rhs_spd(applied_, rhs_s_);
     world_.build_rhs_skew(applied_, rhs_k_);
@@ -593,4 +593,37 @@ HallPotentialComponents PoissonCudaSession::hall_potential_components() const {
         "PoissonCudaSession: hall_potential_components() requires at least one iterate() call");
   }
   return hall_components_;
+}
+
+const std::vector<float>& PoissonCudaSession::winding_fm_stack() const {
+  if (!hall_frame_available_) {
+    throw std::runtime_error(
+        "PoissonCudaSession: winding() requires at least one iterate() call");
+  }
+  if (!world_.the_enabled()) {
+    throw std::runtime_error("PoissonCudaSession: winding() requires the_enabled=True");
+  }
+  return world_.winding_fm_stack();
+}
+
+std::vector<float> PoissonCudaSession::the_hall_vector_fm_stack() const {
+  if (!world_.the_enabled()) {
+    throw std::runtime_error("PoissonCudaSession: the_hall_vector() requires the_enabled=True");
+  }
+  if (!hall_frame_available_) {
+    throw std::runtime_error(
+        "PoissonCudaSession: the_hall_vector() requires at least one iterate() call");
+  }
+  return world_.the_hall_vector_fm_stack();
+}
+
+void PoissonCudaSession::winding_stats(float& max_abs, double& sum_hz) const {
+  if (!world_.the_enabled()) {
+    throw std::runtime_error("PoissonCudaSession: winding_stats() requires the_enabled=True");
+  }
+  if (!hall_frame_available_) {
+    throw std::runtime_error(
+        "PoissonCudaSession: winding_stats() requires at least one iterate() call");
+  }
+  world_.winding_stats(max_abs, sum_hz);
 }

@@ -350,7 +350,7 @@ void PoissonPcgCuda::clear_skew_operator() {
 
 void PoissonPcgCuda::upload_skew_operator(const PoissonWorld& world) {
   world_ = &world;
-  if (!world.ahe_enabled()) {
+  if (!world.skew_enabled()) {
     clear_skew_operator();
     return;
   }

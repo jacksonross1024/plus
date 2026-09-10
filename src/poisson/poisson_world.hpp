@@ -23,8 +23,12 @@ struct ManifestData {
 struct TransportConfig {
   bool amr_enabled = false;
   bool ahe_enabled = false;
+  bool the_enabled = false;
   double amr_ratio = 0.0;
   double ahe_ratio = 0.0;
+  // Dimensionless THE scale: Sigma_THE = (the_ratio * sigma) * [h]_x where h is
+  // the cell-local 3D winding from m·(Δm×Δm) (no 1/4π, no /Δx). Default 0.
+  double the_ratio = 0.0;
   int picard_sweeps = 2;
   double picard_tolerance = 0.0;
 };
@@ -93,9 +97,19 @@ class PoissonWorld {
   const std::vector<float>& skew_values() const { return skew_values_; }
 
   const TransportConfig& transport_config() const { return config_; }
-  bool transport_enabled() const { return config_.amr_enabled || config_.ahe_enabled; }
+  bool transport_enabled() const {
+    return config_.amr_enabled || config_.ahe_enabled || config_.the_enabled;
+  }
   bool amr_enabled() const { return config_.amr_enabled; }
   bool ahe_enabled() const { return config_.ahe_enabled; }
+  bool the_enabled() const { return config_.the_enabled; }
+  bool skew_enabled() const { return config_.ahe_enabled || config_.the_enabled; }
+
+  /// Cell-local winding on the FM stack, mumax layout (3, n_fm, ny, nx). Empty if THE is off.
+  const std::vector<float>& winding_fm_stack() const { return winding_; }
+  void winding_stats(float& max_abs, double& sum_hz) const;
+  /// σ_THE h = (the_ratio · σ₀) h on the FM stack, same layout as magnetization.
+  std::vector<float> the_hall_vector_fm_stack() const;
 
   bool is_pt(int cell) const {
     return region_[static_cast<std::size_t>(cell)] == 1;
@@ -121,7 +135,7 @@ class PoissonWorld {
   void set_magnetization_fm_stack(const std::vector<float>& magnetization_mumax);
   void refresh_transport_tensors();
   void rebuild_transport_operators();
-  /// Build maximal AMR/AHE CSR sparsity from geometry only (no m dependence).
+  /// Build maximal AMR/AHE/THE CSR sparsity from geometry only (no m dependence).
   /// Values are placeholders; GMRES device update overwrites them each step.
   void build_transport_pattern_operators();
 
@@ -167,6 +181,7 @@ class PoissonWorld {
   SymTensor6 sym_tensor_for_cell(int cell) const;
   SkewTensor3 skew_tensor_for_cell(int cell) const;
   void refresh_cell_tensors();
+  void refresh_winding_fm_stack();
 
   static ManifestData parse_manifest(const std::string& manifest_path);
   void validate_loaded_geometry();
@@ -196,5 +211,7 @@ class PoissonWorld {
   std::vector<SkewTensor3> skew_tensor_;
   // Magnetization on the Poisson FM stack, mumax layout (3, n_fm, ny, nx).
   std::vector<float> magnetization_;
+  // Cell-local THE winding h, same layout as magnetization_.
+  std::vector<float> winding_;
   bool magnetization_set_ = false;
 };

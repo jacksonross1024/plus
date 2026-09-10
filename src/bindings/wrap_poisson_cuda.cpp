@@ -74,6 +74,8 @@ TransportConfig transport_from_args(bool amr_enabled,
                                     double amr_ratio,
                                     bool ahe_enabled,
                                     double ahe_ratio,
+                                    bool the_enabled,
+                                    double the_ratio,
                                     int picard_sweeps,
                                     double picard_tolerance) {
   TransportConfig cfg;
@@ -81,6 +83,8 @@ TransportConfig transport_from_args(bool amr_enabled,
   cfg.amr_ratio = amr_ratio;
   cfg.ahe_enabled = ahe_enabled;
   cfg.ahe_ratio = ahe_ratio;
+  cfg.the_enabled = the_enabled;
+  cfg.the_ratio = the_ratio;
   cfg.picard_sweeps = picard_sweeps;
   cfg.picard_tolerance = picard_tolerance;
   return cfg;
@@ -204,6 +208,21 @@ HallProbeIndices hall_probes_from_nested_arrays(
     probes.low_y[static_cast<std::size_t>(c)].assign(low_data, low_data + low_info.shape[0]);
   }
   return probes;
+}
+
+py::array_t<float> fm_stack_to_numpy_mumax(const std::vector<float>& stack, int nz, int ny,
+                                          int nx) {
+  py::array_t<float> out({3, nz, ny, nx});
+  const std::size_t n = 3u * static_cast<std::size_t>(nz) * static_cast<std::size_t>(ny) *
+                        static_cast<std::size_t>(nx);
+  if (stack.size() != n) {
+    if (stack.empty()) {
+      return out;
+    }
+    throw std::runtime_error("FM-stack size does not match (3, nz, ny, nx)");
+  }
+  std::memcpy(out.mutable_data(), stack.data(), n * sizeof(float));
+  return out;
 }
 
 py::array_t<double> vector_to_numpy_1d(const std::vector<double>& values) {
@@ -345,6 +364,8 @@ void wrap_poisson_cuda(py::module& m) {
              double amr_ratio,
              bool ahe_enabled,
              double ahe_ratio,
+             bool the_enabled,
+             double the_ratio,
              int picard_sweeps,
              double picard_tolerance,
              const std::string& solver,
@@ -353,8 +374,8 @@ void wrap_poisson_cuda(py::module& m) {
                 PoissonWorld::load(manifest_path), contact_potentials_from_array(potentials_array),
                 tolerance, max_iterations, skip_threshold, slice_x, slice_y, slice_z,
                 cuda_tol_batch_first, cuda_tol_batch_next,
-                transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps,
-                                    picard_tolerance),
+                transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled,
+                                    the_ratio, picard_sweeps, picard_tolerance),
                 solver_kind_from_string(solver), gmres_restart);
           },
           py::arg("manifest_path"),
@@ -371,6 +392,8 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("amr_ratio") = 0.0,
           py::arg("ahe_enabled") = false,
           py::arg("ahe_ratio") = 0.0,
+          py::arg("the_enabled") = false,
+          py::arg("the_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
           py::arg("picard_tolerance") = 0.0,
           py::arg("solver") = "gmres_cusparse",
@@ -402,6 +425,8 @@ void wrap_poisson_cuda(py::module& m) {
              double amr_ratio,
              bool ahe_enabled,
              double ahe_ratio,
+             bool the_enabled,
+             double the_ratio,
              int picard_sweeps,
              double picard_tolerance,
              const std::string& solver,
@@ -426,8 +451,8 @@ void wrap_poisson_cuda(py::module& m) {
                 std::move(world), contact_potentials_from_array(potentials_array), tolerance,
                 max_iterations, skip_threshold, slice_x, slice_y, slice_z, cuda_tol_batch_first,
                 cuda_tol_batch_next,
-                transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps,
-                                    picard_tolerance),
+                transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled,
+                                    the_ratio, picard_sweeps, picard_tolerance),
                 solver_kind_from_string(solver), gmres_restart);
           },
           py::arg("nx"),
@@ -455,6 +480,8 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("amr_ratio") = 0.0,
           py::arg("ahe_enabled") = false,
           py::arg("ahe_ratio") = 0.0,
+          py::arg("the_enabled") = false,
+          py::arg("the_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
           py::arg("picard_tolerance") = 0.0,
           py::arg("solver") = "gmres_cusparse",
@@ -479,6 +506,8 @@ void wrap_poisson_cuda(py::module& m) {
              double amr_ratio,
              bool ahe_enabled,
              double ahe_ratio,
+             bool the_enabled,
+             double the_ratio,
              int picard_sweeps,
              double picard_tolerance,
              const std::string& solver,
@@ -489,8 +518,8 @@ void wrap_poisson_cuda(py::module& m) {
                                                        num_contacts),
                 tolerance, max_iterations, skip_threshold, slice_x, slice_y, slice_z,
                 cuda_tol_batch_first, cuda_tol_batch_next,
-                transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps,
-                                    picard_tolerance),
+                transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled,
+                                    the_ratio, picard_sweeps, picard_tolerance),
                 solver_kind_from_string(solver), gmres_restart);
           },
           py::arg("manifest_path"),
@@ -511,6 +540,8 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("amr_ratio") = 0.0,
           py::arg("ahe_enabled") = false,
           py::arg("ahe_ratio") = 0.0,
+          py::arg("the_enabled") = false,
+          py::arg("the_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
           py::arg("picard_tolerance") = 0.0,
           py::arg("solver") = "gmres_cusparse",
@@ -542,6 +573,29 @@ void wrap_poisson_cuda(py::module& m) {
           [](const PoissonCudaSession& session) {
             return hall_components_to_dict(session.hall_potential_components());
           })
+      .def(
+          "winding_fm_stack",
+          [](const PoissonCudaSession& session) {
+            return fm_stack_to_numpy_mumax(session.winding_fm_stack(), session.fm_layer_count(),
+                                           session.ny(), session.nx());
+          })
+      .def(
+          "the_hall_vector_fm_stack",
+          [](const PoissonCudaSession& session) {
+            return fm_stack_to_numpy_mumax(session.the_hall_vector_fm_stack(),
+                                           session.fm_layer_count(), session.ny(), session.nx());
+          })
+      .def(
+          "winding_stats",
+          [](const PoissonCudaSession& session) {
+            float max_abs = 0.0f;
+            double sum_hz = 0.0;
+            session.winding_stats(max_abs, sum_hz);
+            py::dict out;
+            out["max_abs"] = max_abs;
+            out["sum_hz"] = sum_hz;
+            return out;
+          })
       .def_property_readonly("hall_probes_configured", &PoissonCudaSession::hall_probes_configured)
       .def_property_readonly("hall_frame_available", &PoissonCudaSession::hall_frame_available)
       .def_property_readonly("last_frame_skipped", &PoissonCudaSession::last_frame_skipped)
@@ -553,8 +607,10 @@ void wrap_poisson_cuda(py::module& m) {
       .def_property_readonly("transport_enabled", &PoissonCudaSession::transport_enabled)
       .def_property_readonly("amr_enabled", &PoissonCudaSession::amr_enabled)
       .def_property_readonly("ahe_enabled", &PoissonCudaSession::ahe_enabled)
+      .def_property_readonly("the_enabled", &PoissonCudaSession::the_enabled)
       .def_property_readonly("amr_ratio", &PoissonCudaSession::amr_ratio)
       .def_property_readonly("ahe_ratio", &PoissonCudaSession::ahe_ratio)
+      .def_property_readonly("the_ratio", &PoissonCudaSession::the_ratio)
       .def_property_readonly("picard_sweeps", &PoissonCudaSession::picard_sweeps)
       .def_property_readonly("solver",
                              [](const PoissonCudaSession& s) {

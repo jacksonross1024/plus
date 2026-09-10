@@ -48,6 +48,71 @@ double axis_spacing(const ManifestData& meta, int axis) {
   return meta.cz;
 }
 
+struct Vec3f {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+};
+
+Vec3f cross3(Vec3f a, Vec3f b) {
+  return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+float dot3(Vec3f a, Vec3f b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+bool load_unit_m_fm(const PoissonWorld& world,
+                    const std::vector<float>& mag,
+                    int fm_layer,
+                    int iy,
+                    int ix,
+                    Vec3f& m) {
+  const int n_fm = world.fm_layer_count();
+  const int nx = world.nx();
+  const int ny = world.ny();
+  if (fm_layer < 0 || fm_layer >= n_fm || ix < 0 || ix >= nx || iy < 0 || iy >= ny) {
+    return false;
+  }
+  const int iz = fm_layer + world.first_r2_layer();
+  const int cell = world.flat_index(iz, iy, ix);
+  if (!world.uses_magnetization(cell)) {
+    return false;
+  }
+  const int plane = nx * ny;
+  const std::size_t n_xy = static_cast<std::size_t>(n_fm) * static_cast<std::size_t>(plane);
+  const std::size_t base = static_cast<std::size_t>(fm_layer) * static_cast<std::size_t>(plane) +
+                           static_cast<std::size_t>(iy) * static_cast<std::size_t>(nx) +
+                           static_cast<std::size_t>(ix);
+  m.x = mag[base];
+  m.y = mag[n_xy + base];
+  m.z = mag[2u * n_xy + base];
+  const float norm = std::sqrt(m.x * m.x + m.y * m.y + m.z * m.z);
+  if (norm > 1e-12f) {
+    m.x /= norm;
+    m.y /= norm;
+    m.z /= norm;
+    return true;
+  }
+  m = {};
+  return false;
+}
+
+Vec3f central_dm(const PoissonWorld& world,
+                 const std::vector<float>& mag,
+                 int fm_layer,
+                 int iy,
+                 int ix,
+                 int dfm,
+                 int diy,
+                 int dix) {
+  Vec3f plus;
+  Vec3f minus;
+  if (!load_unit_m_fm(world, mag, fm_layer + dfm, iy + diy, ix + dix, plus) ||
+      !load_unit_m_fm(world, mag, fm_layer - dfm, iy - diy, ix - dix, minus)) {
+    return {};
+  }
+  return {0.5f * (plus.x - minus.x), 0.5f * (plus.y - minus.y), 0.5f * (plus.z - minus.z)};
+}
+
 double dirichlet_potential(std::int8_t contact_id, const std::vector<double>& potentials) {
   const int channel = std::abs(static_cast<int>(contact_id)) - 1;
   const double sign = contact_id > 0 ? 1.0 : -1.0;
@@ -279,13 +344,17 @@ void PoissonWorld::set_transport_config(TransportConfig config) {
   if (config.ahe_enabled && !std::isfinite(config.ahe_ratio)) {
     throw std::runtime_error("ahe_ratio must be finite when AHE is enabled");
   }
-  if (config.ahe_enabled && config.picard_sweeps < 1) {
-    throw std::runtime_error("picard_sweeps must be >= 1 when AHE is enabled");
+  if (config.the_enabled && !std::isfinite(config.the_ratio)) {
+    throw std::runtime_error("the_ratio must be finite when THE is enabled");
+  }
+  if ((config.ahe_enabled || config.the_enabled) && config.picard_sweeps < 1) {
+    throw std::runtime_error("picard_sweeps must be >= 1 when AHE or THE is enabled");
   }
   config_ = config;
   if (!transport_enabled()) {
     magnetization_set_ = false;
     magnetization_.clear();
+    winding_.clear();
     sym_tensor_.clear();
     skew_tensor_.clear();
     skew_row_offsets_.clear();
@@ -320,6 +389,7 @@ void PoissonWorld::refresh_transport_tensors() {
   if (!transport_enabled()) {
     sym_tensor_.clear();
     skew_tensor_.clear();
+    winding_.clear();
     return;
   }
   if (!magnetization_set_) {
@@ -405,11 +475,11 @@ SymTensor6 PoissonWorld::sym_tensor_for_cell(int cell) const {
 }
 
 SkewTensor3 PoissonWorld::skew_tensor_for_cell(int cell) const {
-  if (!config_.ahe_enabled || !uses_magnetization(cell)) {
+  if (!skew_enabled() || !uses_magnetization(cell)) {
     return {};
   }
   if (!magnetization_set_) {
-    throw std::runtime_error("AHE enabled but magnetization has not been set");
+    throw std::runtime_error("AHE/THE enabled but magnetization has not been set");
   }
 
   const float s = sigma_[static_cast<std::size_t>(cell)];
@@ -429,25 +499,133 @@ SkewTensor3 PoissonWorld::skew_tensor_for_cell(int cell) const {
       static_cast<std::size_t>(fm_layer) * static_cast<std::size_t>(plane) +
       static_cast<std::size_t>(iy) * static_cast<std::size_t>(meta_.nx) +
       static_cast<std::size_t>(ix);
-  float mx = magnetization_[base];
-  float my = magnetization_[n_xy + base];
-  float mz = magnetization_[2u * n_xy + base];
-  const float norm = std::sqrt(mx * mx + my * my + mz * mz);
-  if (norm > 1e-12f) {
-    mx /= norm;
-    my /= norm;
-    mz /= norm;
-  } else {
-    return {};
+
+  SkewTensor3 k{};
+  if (config_.ahe_enabled) {
+    float mx = magnetization_[base];
+    float my = magnetization_[n_xy + base];
+    float mz = magnetization_[2u * n_xy + base];
+    const float norm = std::sqrt(mx * mx + my * my + mz * mz);
+    if (norm > 1e-12f) {
+      mx /= norm;
+      my /= norm;
+      mz /= norm;
+      const float sigma_ahe = static_cast<float>(config_.ahe_ratio * static_cast<double>(s));
+      // Sigma_AHE = sigma_ahe * [[0,-mz,my],[mz,0,-mx],[-my,mx,0]]
+      // Stored upper triangle (xy, xz, yz) = (-mz, my, -mx) * sigma_ahe
+      k.xy += -sigma_ahe * mz;
+      k.xz += sigma_ahe * my;
+      k.yz += -sigma_ahe * mx;
+    }
+  }
+  if (config_.the_enabled) {
+    if (winding_.size() != 3u * n_xy) {
+      throw std::runtime_error("THE enabled but winding has not been computed");
+    }
+    const float hx = winding_[base];
+    const float hy = winding_[n_xy + base];
+    const float hz = winding_[2u * n_xy + base];
+    const float sigma_the = static_cast<float>(config_.the_ratio * static_cast<double>(s));
+    // Same skew storage as AHE: (xy, xz, yz) = (-h_z, h_y, -h_x) * sigma_the
+    k.xy += -sigma_the * hz;
+    k.xz += sigma_the * hy;
+    k.yz += -sigma_the * hx;
+  }
+  return k;
+}
+
+void PoissonWorld::refresh_winding_fm_stack() {
+  const int n_fm = fm_layer_count();
+  const int plane = meta_.nx * meta_.ny;
+  const std::size_t n_xy = static_cast<std::size_t>(n_fm) * static_cast<std::size_t>(plane);
+  winding_.assign(3u * n_xy, 0.0f);
+  if (!config_.the_enabled || !magnetization_set_ || n_fm <= 0) {
+    if (!config_.the_enabled) {
+      winding_.clear();
+    }
+    return;
   }
 
-  const float sigma_ahe = static_cast<float>(config_.ahe_ratio * static_cast<double>(s));
-  // Sigma_AHE = sigma_ahe * [[0,-mz,my],[mz,0,-mx],[-my,mx,0]]
-  // Stored upper triangle (xy, xz, yz) = (-mz, my, -mx) * sigma_ahe
-  return {-sigma_ahe * mz, sigma_ahe * my, -sigma_ahe * mx};
+  for (int fm = 0; fm < n_fm; ++fm) {
+    for (int iy = 0; iy < meta_.ny; ++iy) {
+      for (int ix = 0; ix < meta_.nx; ++ix) {
+        Vec3f m;
+        if (!load_unit_m_fm(*this, magnetization_, fm, iy, ix, m)) {
+          continue;
+        }
+        const Vec3f dmx = central_dm(*this, magnetization_, fm, iy, ix, 0, 0, 1);
+        const Vec3f dmy = central_dm(*this, magnetization_, fm, iy, ix, 0, 1, 0);
+        const Vec3f dmz = central_dm(*this, magnetization_, fm, iy, ix, 1, 0, 0);
+        // Φ₀-consistent 3D winding (no Levi-Civita double count):
+        // h_x = m·(∂y m × ∂z m), h_y = m·(∂z m × ∂x m), h_z = m·(∂x m × ∂y m)
+        // δα m is 0.5*(m_{+α}-m_{-α}) when both neighbors are valid magnetized FM
+        // conducting cells; otherwise 0 (no ghost m, no /Δx).
+        const Vec3f h{dot3(m, cross3(dmy, dmz)), dot3(m, cross3(dmz, dmx)),
+                      dot3(m, cross3(dmx, dmy))};
+        const std::size_t base = static_cast<std::size_t>(fm) * static_cast<std::size_t>(plane) +
+                                 static_cast<std::size_t>(iy) * static_cast<std::size_t>(meta_.nx) +
+                                 static_cast<std::size_t>(ix);
+        winding_[base] = h.x;
+        winding_[n_xy + base] = h.y;
+        winding_[2u * n_xy + base] = h.z;
+      }
+    }
+  }
+}
+
+void PoissonWorld::winding_stats(float& max_abs, double& sum_hz) const {
+  max_abs = 0.0f;
+  sum_hz = 0.0;
+  if (winding_.empty()) {
+    return;
+  }
+  const int n_fm = fm_layer_count();
+  const int plane = meta_.nx * meta_.ny;
+  const std::size_t n_xy = static_cast<std::size_t>(n_fm) * static_cast<std::size_t>(plane);
+  if (winding_.size() != 3u * n_xy) {
+    return;
+  }
+  for (std::size_t i = 0; i < n_xy; ++i) {
+    const float hx = winding_[i];
+    const float hy = winding_[n_xy + i];
+    const float hz = winding_[2u * n_xy + i];
+    const float mag = std::sqrt(hx * hx + hy * hy + hz * hz);
+    if (mag > max_abs) {
+      max_abs = mag;
+    }
+    sum_hz += static_cast<double>(hz);
+  }
+}
+
+std::vector<float> PoissonWorld::the_hall_vector_fm_stack() const {
+  if (winding_.empty() || !config_.the_enabled) {
+    return {};
+  }
+  const int n_fm = fm_layer_count();
+  const int plane = meta_.nx * meta_.ny;
+  const std::size_t n_xy = static_cast<std::size_t>(n_fm) * static_cast<std::size_t>(plane);
+  std::vector<float> out(3u * n_xy, 0.0f);
+  for (int fm = 0; fm < n_fm; ++fm) {
+    for (int iy = 0; iy < meta_.ny; ++iy) {
+      for (int ix = 0; ix < meta_.nx; ++ix) {
+        const int iz = fm + meta_.first_r2_layer;
+        const int cell = flat_index(iz, iy, ix);
+        const float scale =
+            static_cast<float>(config_.the_ratio * static_cast<double>(sigma_[static_cast<std::size_t>(cell)]));
+        const std::size_t base = static_cast<std::size_t>(fm) * static_cast<std::size_t>(plane) +
+                                 static_cast<std::size_t>(iy) * static_cast<std::size_t>(meta_.nx) +
+                                 static_cast<std::size_t>(ix);
+        out[base] = scale * winding_[base];
+        out[n_xy + base] = scale * winding_[n_xy + base];
+        out[2u * n_xy + base] = scale * winding_[2u * n_xy + base];
+      }
+    }
+  }
+  return out;
 }
 
 void PoissonWorld::refresh_cell_tensors() {
+  refresh_winding_fm_stack();
   sym_tensor_.assign(static_cast<std::size_t>(cell_count()), {});
   skew_tensor_.assign(static_cast<std::size_t>(cell_count()), {});
   for (int cell = 0; cell < cell_count(); ++cell) {
@@ -846,7 +1024,7 @@ void PoissonWorld::build_transport_operators() {
   spd.rows.assign(static_cast<std::size_t>(n_unknown), {});
 
   MatrixBuilder skew;
-  if (config_.ahe_enabled) {
+  if (config_.ahe_enabled || config_.the_enabled) {
     skew.diagonal.assign(static_cast<std::size_t>(n_unknown), 0.0f);
     skew.rhs_weight.assign(static_cast<std::size_t>(num_contacts_),
                            std::vector<float>(static_cast<std::size_t>(n_unknown), 0.0f));
@@ -899,7 +1077,7 @@ void PoissonWorld::build_transport_operators() {
       const float face_yz = avg_signed(s0.yz, s1.yz);
       add_cross_terms_for_face(spd, cell, nbr, axis, face_xy, face_xz, face_yz, false);
 
-      if (config_.ahe_enabled) {
+      if (config_.ahe_enabled || config_.the_enabled) {
         const float k_xy = avg_signed(k0.xy, k1.xy);
         const float k_xz = avg_signed(k0.xz, k1.xz);
         const float k_yz = avg_signed(k0.yz, k1.yz);
@@ -912,11 +1090,11 @@ void PoissonWorld::build_transport_operators() {
   finalize_matrix(spd, row_offsets_, col_indices_, offdiag_conductance_, diagonal_,
                   rhs_weight_);
 
-  if (config_.ahe_enabled) {
+  if (config_.ahe_enabled || config_.the_enabled) {
     // Skew diagonals should remain ~0; allow slightly non-positive diagonals.
     for (float& d : skew.diagonal) {
       if (!(std::isfinite(d))) {
-        throw std::runtime_error("non-finite skew diagonal during AHE assembly");
+        throw std::runtime_error("non-finite skew diagonal during AHE/THE assembly");
       }
       // Keep a tiny positive diagonal so finalize_matrix isolation check still works
       // for rows that only have skew contact couplings and no unknown neighbors.
@@ -1040,7 +1218,7 @@ void PoissonWorld::build_transport_pattern_operators() {
       {{0, 1, 0, 1}},  {{0, 0, -1, 2}}, {{0, 0, 1, 2}},
   }};
 
-  const bool need_cross = config_.amr_enabled || config_.ahe_enabled;
+  const bool need_cross = config_.amr_enabled || config_.ahe_enabled || config_.the_enabled;
   const int plane = meta_.nx * meta_.ny;
   for (int row = 0; row < n_unknown; ++row) {
     const int cell = unknown_to_cell_[static_cast<std::size_t>(row)];
@@ -1129,7 +1307,7 @@ void PoissonWorld::build_rhs_spd(const std::vector<double>& potentials,
 
 void PoissonWorld::build_rhs_skew(const std::vector<double>& potentials,
                                   std::vector<double>& rhs) const {
-  if (!config_.ahe_enabled) {
+  if (!config_.ahe_enabled && !config_.the_enabled) {
     rhs.assign(static_cast<std::size_t>(unknown_count()), 0.0);
     return;
   }

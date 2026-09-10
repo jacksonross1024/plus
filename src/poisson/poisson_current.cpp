@@ -149,8 +149,8 @@ void compute_j_raw_from_phi(const PoissonWorld& world,
 
         const SymTensor6 S = world.sym_tensor(cell);
         const SkewTensor3 K = world.skew_tensor(cell);
-        // J = -(Sigma_AMR + Sigma_AHE) grad phi
-        // Sigma_AHE upper triangle (xy,xz,yz) with antisymmetry.
+        // J = -(Sigma_AMR + Sigma_AHE + Sigma_THE) grad phi
+        // Skew upper triangle (xy,xz,yz) with antisymmetry.
         const float ex = -dphi_dx;
         const float ey = -dphi_dy;
         const float ez = -dphi_dz;

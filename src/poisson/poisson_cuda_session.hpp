@@ -72,8 +72,10 @@ class PoissonCudaSession {
   bool transport_enabled() const { return world_.transport_enabled(); }
   bool amr_enabled() const { return world_.amr_enabled(); }
   bool ahe_enabled() const { return world_.ahe_enabled(); }
+  bool the_enabled() const { return world_.the_enabled(); }
   double amr_ratio() const { return transport_config_.amr_ratio; }
   double ahe_ratio() const { return transport_config_.ahe_ratio; }
+  double the_ratio() const { return transport_config_.the_ratio; }
   int picard_sweeps() const { return transport_config_.picard_sweeps; }
   PoissonLinearSolverKind solver_kind() const { return solver_kind_; }
 
@@ -90,6 +92,9 @@ class PoissonCudaSession {
   bool last_frame_skipped() const { return last_frame_skipped_; }
   const std::vector<double>& hall_potentials() const;
   HallPotentialComponents hall_potential_components() const;
+  const std::vector<float>& winding_fm_stack() const;
+  std::vector<float> the_hall_vector_fm_stack() const;
+  void winding_stats(float& max_abs, double& sum_hz) const;
 
  private:
   static void validate_contact_potentials(const PoissonWorld& world,

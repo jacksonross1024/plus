@@ -681,7 +681,7 @@ def build_fgat_world_spec(
 
     ``void_sigma`` controls nonmagnetic void/filler cells (``region==0``):
     ``0.0`` keeps insulating holes; ``>0`` makes them high-resistance scalar
-    conductors without AMR/AHE.
+    conductors without AMR/AHE/THE.
     """
 
     nz, ny, nx = tuple(int(v) for v in shape)
@@ -1166,18 +1166,24 @@ def _validate_transport_args(
     amr_ratio: float,
     ahe_enabled: bool,
     ahe_ratio: float,
+    the_enabled: bool,
+    the_ratio: float,
     picard_sweeps: int,
 ) -> None:
     if not amr_enabled and float(amr_ratio) != 0.0:
         raise ValueError("amr_ratio requires amr_enabled=True")
     if not ahe_enabled and float(ahe_ratio) != 0.0:
         raise ValueError("ahe_ratio requires ahe_enabled=True")
+    if not the_enabled and float(the_ratio) != 0.0:
+        raise ValueError("the_ratio requires the_enabled=True")
     if amr_enabled and float(amr_ratio) < 0.0:
         raise ValueError("amr_ratio must be >= 0")
     if ahe_enabled and not np.isfinite(float(ahe_ratio)):
         raise ValueError("ahe_ratio must be finite when AHE is enabled")
-    if ahe_enabled and int(picard_sweeps) < 1:
-        raise ValueError("picard_sweeps must be >= 1 when AHE is enabled")
+    if the_enabled and not np.isfinite(float(the_ratio)):
+        raise ValueError("the_ratio must be finite when THE is enabled")
+    if (ahe_enabled or the_enabled) and int(picard_sweeps) < 1:
+        raise ValueError("picard_sweeps must be >= 1 when AHE or THE is enabled")
 
 
 def _normalize_linear_solver(solver: str) -> str:
@@ -1255,6 +1261,8 @@ class CudaPoissonSolver:
         amr_ratio: float = 0.0,
         ahe_enabled: bool = False,
         ahe_ratio: float = 0.0,
+        the_enabled: bool = False,
+        the_ratio: float = 0.0,
         picard_sweeps: int = 2,
         picard_tolerance: float = 0.0,
         solver: str = "gmres_cusparse",
@@ -1262,7 +1270,7 @@ class CudaPoissonSolver:
     ) -> None:
         potentials = _normalize_contact_potentials(contact_potentials)
         _validate_transport_args(
-            amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps
+            amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled, the_ratio, picard_sweeps
         )
 
         if world is not None and manifest_path is not None:
@@ -1282,11 +1290,15 @@ class CudaPoissonSolver:
 
         self._amr_enabled = bool(amr_enabled)
         self._ahe_enabled = bool(ahe_enabled)
+        self._the_enabled = bool(the_enabled)
         self._amr_ratio = float(amr_ratio)
         self._ahe_ratio = float(ahe_ratio)
+        self._the_ratio = float(the_ratio)
         self._picard_sweeps = int(picard_sweeps)
         self._picard_tolerance = float(picard_tolerance)
-        self._transport_enabled = bool(self._amr_enabled or self._ahe_enabled)
+        self._transport_enabled = bool(
+            self._amr_enabled or self._ahe_enabled or self._the_enabled
+        )
         self._solver = _normalize_linear_solver(solver)
         self._gmres_restart = int(gmres_restart)
         if self._gmres_restart < 2:
@@ -1297,6 +1309,8 @@ class CudaPoissonSolver:
             "amr_ratio": self._amr_ratio,
             "ahe_enabled": self._ahe_enabled,
             "ahe_ratio": self._ahe_ratio,
+            "the_enabled": self._the_enabled,
+            "the_ratio": self._the_ratio,
             "picard_sweeps": self._picard_sweeps,
             "picard_tolerance": self._picard_tolerance,
             "solver": self._solver,
@@ -1380,6 +1394,8 @@ class CudaPoissonSolver:
         amr_ratio: float = 0.0,
         ahe_enabled: bool = False,
         ahe_ratio: float = 0.0,
+        the_enabled: bool = False,
+        the_ratio: float = 0.0,
         picard_sweeps: int = 2,
         picard_tolerance: float = 0.0,
         solver: str = "gmres_cusparse",
@@ -1388,7 +1404,7 @@ class CudaPoissonSolver:
         """Construct from a single-column signal file using C++ resampling rules."""
 
         _validate_transport_args(
-            amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, picard_sweeps
+            amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled, the_ratio, picard_sweeps
         )
         manifest = manifest_path or default_world_path()
         first_r2 = _parse_first_r2_from_manifest(manifest)
@@ -1403,11 +1419,13 @@ class CudaPoissonSolver:
         obj._hall_z_mode = "contact"
         obj._amr_enabled = bool(amr_enabled)
         obj._ahe_enabled = bool(ahe_enabled)
+        obj._the_enabled = bool(the_enabled)
         obj._amr_ratio = float(amr_ratio)
         obj._ahe_ratio = float(ahe_ratio)
+        obj._the_ratio = float(the_ratio)
         obj._picard_sweeps = int(picard_sweeps)
         obj._picard_tolerance = float(picard_tolerance)
-        obj._transport_enabled = bool(obj._amr_enabled or obj._ahe_enabled)
+        obj._transport_enabled = bool(obj._amr_enabled or obj._ahe_enabled or obj._the_enabled)
         obj._solver = _normalize_linear_solver(solver)
         obj._gmres_restart = int(gmres_restart)
         if obj._gmres_restart < 2:
@@ -1431,6 +1449,8 @@ class CudaPoissonSolver:
             float(amr_ratio),
             bool(ahe_enabled),
             float(ahe_ratio),
+            bool(the_enabled),
+            float(the_ratio),
             int(picard_sweeps),
             float(picard_tolerance),
             obj._solver,
@@ -1584,7 +1604,7 @@ class CudaPoissonSolver:
 
     @property
     def transport_enabled(self) -> bool:
-        """Whether AMR and/or AHE transport is enabled."""
+        """Whether AMR, AHE, and/or THE transport is enabled."""
 
         return self._transport_enabled
 
@@ -1597,12 +1617,20 @@ class CudaPoissonSolver:
         return self._ahe_enabled
 
     @property
+    def the_enabled(self) -> bool:
+        return self._the_enabled
+
+    @property
     def amr_ratio(self) -> float:
         return self._amr_ratio
 
     @property
     def ahe_ratio(self) -> float:
         return self._ahe_ratio
+
+    @property
+    def the_ratio(self) -> float:
+        return self._the_ratio
 
     @property
     def picard_sweeps(self) -> int:
@@ -1754,6 +1782,42 @@ class CudaPoissonSolver:
                 "native Poisson solver does not expose hall_potentials; rebuild mumaxplus"
             )
         return np.ascontiguousarray(voltages_fn(), dtype=np.float64)
+
+    def winding(self) -> np.ndarray:
+        """Return per-cell 3D winding ``h``, mumax layout ``(3, nz_export, ny, nx)``.
+
+        ``h`` is the dimensionless cell-local density
+        ``m · (Δm × Δm)`` used by THE (not a unit vector). Requires THE and at
+        least one ``iterate()`` call.
+        """
+
+        fn = getattr(self._impl, "winding_fm_stack", None)
+        if fn is None:
+            raise RuntimeError(
+                "native Poisson solver does not expose winding_fm_stack; rebuild mumaxplus"
+            )
+        return self._map_fm_export(np.ascontiguousarray(fn(), dtype=np.float32))
+
+    def the_hall_vector(self) -> np.ndarray:
+        """Return ``σ_THE h = (the_ratio · σ₀) h``, mumax layout ``(3, nz_export, ny, nx)``."""
+
+        fn = getattr(self._impl, "the_hall_vector_fm_stack", None)
+        if fn is None:
+            raise RuntimeError(
+                "native Poisson solver does not expose the_hall_vector_fm_stack; rebuild mumaxplus"
+            )
+        return self._map_fm_export(np.ascontiguousarray(fn(), dtype=np.float32))
+
+    def winding_stats(self) -> Dict[str, float]:
+        """Return scalar winding diagnostics: ``max_abs`` and ``sum_hz`` (proxy for total Q)."""
+
+        fn = getattr(self._impl, "winding_stats", None)
+        if fn is None:
+            raise RuntimeError(
+                "native Poisson solver does not expose winding_stats; rebuild mumaxplus"
+            )
+        raw = fn()
+        return {"max_abs": float(raw["max_abs"]), "sum_hz": float(raw["sum_hz"])}
 
     def _average_magnetization_over_z(self, m: np.ndarray) -> np.ndarray:
         """Average mumax ``(3, nz, ny, nx)`` over z and renormalize to unit vectors.
@@ -1952,7 +2016,7 @@ class CudaPoissonSolver:
         ----------
         magnetization : array_like, optional
             Magnetization in mumax layout ``(3, nz_export, ny, nx)`` or
-            ``(3, ny, nx)``. Required when AMR/AHE transport is enabled
+            ``(3, ny, nx)``. Required when AMR/AHE/THE transport is enabled
             (except for skipped near-zero contact frames). Ignored on the
             scalar path. If ``nz_export`` is smaller than the Poisson FM
             stack, the solver averages mumax z-layers and broadcasts that

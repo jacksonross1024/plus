@@ -74,6 +74,7 @@ class PoissonGmresCuda {
   signed char* d_contact_id_ = nullptr;
   float* d_sigma_ = nullptr;
   float* d_magnetization_ = nullptr;
+  float* d_h_ = nullptr;
   double* d_contact_potentials_ = nullptr;
   int* d_update_fail_ = nullptr;
   int cell_count_ = 0;
@@ -88,8 +89,10 @@ class PoissonGmresCuda {
   double cz_ = 0.0;
   bool amr_enabled_ = false;
   bool ahe_enabled_ = false;
+  bool the_enabled_ = false;
   double amr_ratio_ = 0.0;
   double ahe_ratio_ = 0.0;
+  double the_ratio_ = 0.0;
   bool transport_update_ready_ = false;
 
   mutable double* d_x_ = nullptr;

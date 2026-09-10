@@ -29,8 +29,10 @@ class _FakeImpl:
         self.transport_enabled = False
         self.amr_enabled = False
         self.ahe_enabled = False
+        self.the_enabled = False
         self.amr_ratio = 0.0
         self.ahe_ratio = 0.0
+        self.the_ratio = 0.0
         self.picard_sweeps = 2
         self.fm_layer_count = nz
         self.last_magnetization = None
@@ -100,6 +102,16 @@ class _FakeImpl:
             "low_y_counts": [int(a.size) for a in self._hall_low],
         }
 
+    def winding_fm_stack(self):
+        nz, ny, nx, _ = self.buffer_shape
+        return np.zeros((3, nz, ny, nx), dtype=np.float32)
+
+    def the_hall_vector_fm_stack(self):
+        return self.winding_fm_stack()
+
+    def winding_stats(self):
+        return {"max_abs": 0.0, "sum_hz": 0.0}
+
     def _frame_for_step(self, step):
         skipped = bool(np.max(np.abs(self._potentials[step])) < 1e-5)
         value = 0.0 if skipped else float(step + 1)
@@ -115,7 +127,7 @@ class _FakeImpl:
         skipped, frame = self._frame_for_step(step)
         if self.transport_enabled and not skipped:
             raise RuntimeError(
-                "magnetization is required when AMR/AHE transport is enabled"
+                "magnetization is required when AMR/AHE/THE transport is enabled"
             )
         self.current_step += 1
         self._hall_frame_available = True
@@ -157,7 +169,7 @@ class _FakeImpl:
                 "rhs_inf": 0.0,
                 "residual_rel": 0.0,
                 "elapsed_s": 0.0,
-                "note": "picard_sweeps=2" if self.ahe_enabled else "amr",
+                "note": "picard_sweeps=2" if (self.ahe_enabled or self.the_enabled) else "amr",
             },
         }
 
@@ -182,6 +194,8 @@ class _FakeRawPoissonCudaSolver:
         amr_ratio=0.0,
         ahe_enabled=False,
         ahe_ratio=0.0,
+        the_enabled=False,
+        the_ratio=0.0,
         picard_sweeps=2,
         picard_tolerance=0.0,
         solver="pcg",
@@ -190,17 +204,21 @@ class _FakeRawPoissonCudaSolver:
         impl = _FakeImpl(contact_potentials)
         impl.amr_enabled = bool(amr_enabled)
         impl.ahe_enabled = bool(ahe_enabled)
+        impl.the_enabled = bool(the_enabled)
         impl.amr_ratio = float(amr_ratio)
         impl.ahe_ratio = float(ahe_ratio)
+        impl.the_ratio = float(the_ratio)
         impl.picard_sweeps = int(picard_sweeps)
         impl.solver = solver
         impl.gmres_restart = int(gmres_restart)
-        impl.transport_enabled = bool(amr_enabled or ahe_enabled)
+        impl.transport_enabled = bool(amr_enabled or ahe_enabled or the_enabled)
         _FakeRawPoissonCudaSolver.last_transport = {
             "amr_enabled": impl.amr_enabled,
             "ahe_enabled": impl.ahe_enabled,
+            "the_enabled": impl.the_enabled,
             "amr_ratio": impl.amr_ratio,
             "ahe_ratio": impl.ahe_ratio,
+            "the_ratio": impl.the_ratio,
             "picard_sweeps": impl.picard_sweeps,
             "solver": impl.solver,
             "gmres_restart": impl.gmres_restart,
@@ -234,6 +252,8 @@ class _FakeRawPoissonCudaSolver:
         amr_ratio=0.0,
         ahe_enabled=False,
         ahe_ratio=0.0,
+        the_enabled=False,
+        the_ratio=0.0,
         picard_sweeps=2,
         picard_tolerance=0.0,
         solver="pcg",
@@ -254,17 +274,21 @@ class _FakeRawPoissonCudaSolver:
         )
         impl.amr_enabled = bool(amr_enabled)
         impl.ahe_enabled = bool(ahe_enabled)
+        impl.the_enabled = bool(the_enabled)
         impl.amr_ratio = float(amr_ratio)
         impl.ahe_ratio = float(ahe_ratio)
+        impl.the_ratio = float(the_ratio)
         impl.picard_sweeps = int(picard_sweeps)
         impl.solver = solver
         impl.gmres_restart = int(gmres_restart)
-        impl.transport_enabled = bool(amr_enabled or ahe_enabled)
+        impl.transport_enabled = bool(amr_enabled or ahe_enabled or the_enabled)
         _FakeRawPoissonCudaSolver.last_transport = {
             "amr_enabled": impl.amr_enabled,
             "ahe_enabled": impl.ahe_enabled,
+            "the_enabled": impl.the_enabled,
             "amr_ratio": impl.amr_ratio,
             "ahe_ratio": impl.ahe_ratio,
+            "the_ratio": impl.the_ratio,
             "picard_sweeps": impl.picard_sweeps,
             "solver": impl.solver,
             "gmres_restart": impl.gmres_restart,
@@ -516,9 +540,11 @@ def test_transport_defaults_off(fake_raw_solver):
     assert not solver.transport_enabled
     assert not solver.amr_enabled
     assert not solver.ahe_enabled
+    assert not solver.the_enabled
     assert solver.solver == "gmres_cusparse"
     assert fake_raw_solver.last_transport["amr_enabled"] is False
     assert fake_raw_solver.last_transport["ahe_enabled"] is False
+    assert fake_raw_solver.last_transport["the_enabled"] is False
 
 
 def test_solver_option_forwards_to_native(fake_raw_solver):
@@ -558,7 +584,32 @@ def test_ahe_ratio_requires_flag(fake_raw_solver):
         )
 
 
-def test_picard_sweeps_must_be_positive(fake_raw_solver):
+def test_the_ratio_requires_flag(fake_raw_solver):
+    with pytest.raises(ValueError, match="the_ratio requires the_enabled"):
+        poisson.CudaPoissonSolver(
+            contact_potentials=np.zeros((1, 3)),
+            the_ratio=0.1,
+        )
+
+
+def test_the_flag_forwards_to_native(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.zeros((1, 3)),
+        the_enabled=True,
+        the_ratio=0.2,
+    )
+    assert solver.the_enabled
+    assert solver.the_ratio == 0.2
+    assert solver.transport_enabled
+    assert fake_raw_solver.last_transport["the_enabled"] is True
+    assert fake_raw_solver.last_transport["the_ratio"] == 0.2
+    with pytest.raises(ValueError, match="picard_sweeps"):
+        poisson.CudaPoissonSolver(
+            contact_potentials=np.zeros((1, 3)),
+            the_enabled=True,
+            the_ratio=0.1,
+            picard_sweeps=0,
+        )
     with pytest.raises(ValueError, match="picard_sweeps"):
         poisson.CudaPoissonSolver(
             contact_potentials=np.zeros((1, 3)),
@@ -850,4 +901,146 @@ def test_hall_geometry_from_masks_rejects_empty():
     mask = np.zeros(spec.shape, dtype=bool)
     with pytest.raises(ValueError, match="empty"):
         poisson.hall_geometry_from_masks(spec, mask, mask)
+
+
+def _small_hall_world():
+    return poisson.build_fgat_world_spec(
+        num_contacts=1,
+        shape=(4, 32, 32),
+        cellsize=(5e-9, 5e-9, 5e-9),
+        contact_layout="manual",
+        contact_size_cells=10,
+        contact_edge_depth_cells=10,
+        void_locations=None,
+    )
+
+
+def _uniform_m(shape, axis=2):
+    m = np.zeros(shape, dtype=np.float32)
+    m[axis, ...] = 1.0
+    return m
+
+
+def _skyrmion_like_m(shape, radius_cells=6.0):
+    _, nz, ny, nx = shape
+    m = np.zeros(shape, dtype=np.float32)
+    cy = 0.5 * (ny - 1)
+    cx = 0.5 * (nx - 1)
+    yy, xx = np.meshgrid(np.arange(ny, dtype=np.float32), np.arange(nx, dtype=np.float32), indexing="ij")
+    dx = xx - cx
+    dy = yy - cy
+    rho = np.sqrt(dx * dx + dy * dy)
+    psi = np.pi * np.clip(rho / float(radius_cells), 0.0, 1.0)
+    mz = np.cos(psi)
+    mr = np.sin(psi)
+    inv = np.where(rho > 1e-6, 1.0 / rho, 0.0)
+    mx = mr * dx * inv
+    my = mr * dy * inv
+    m[0, ...] = mx
+    m[1, ...] = my
+    m[2, ...] = mz
+    norm = np.linalg.norm(m, axis=0, keepdims=True)
+    m = np.where(norm > 1e-12, m / np.maximum(norm, 1e-12), 0.0)
+    return np.ascontiguousarray(m, dtype=np.float32)
+
+
+def _try_real_solver(**kwargs):
+    try:
+        return poisson.CudaPoissonSolver(**kwargs)
+    except Exception as exc:  # pragma: no cover - depends on local CUDA
+        pytest.skip(f"CUDA Poisson solver unavailable: {exc}")
+
+
+def test_the_uniform_m_vanishes_and_matches_ahe_only():
+    spec = _small_hall_world()
+    potentials = np.full((1, 1), 1e-3, dtype=np.float64)
+    common = dict(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ahe_enabled=True,
+        ahe_ratio=0.05,
+        picard_sweeps=3,
+        solver="gmres_cusparse",
+    )
+    ahe_only = _try_real_solver(**common)
+    both = _try_real_solver(the_enabled=True, the_ratio=0.2, **common)
+    m = _uniform_m(ahe_only.output_shape)
+    ahe_only.iterate(magnetization=m)
+    frame = both.iterate(magnetization=m)
+    v_ahe = ahe_only.hall_potentials()
+    v_both = both.hall_potentials()
+    np.testing.assert_allclose(v_both, v_ahe, rtol=1e-4, atol=1e-9)
+    stats = both.winding_stats()
+    assert stats["max_abs"] < 1e-6
+    h = both.winding()
+    assert h.shape == both.output_shape
+    np.testing.assert_allclose(h, 0.0, atol=1e-6)
+    assert frame.jmod.shape == both.output_shape
+    assert frame.jcur.shape == both.output_shape
+    assert frame.jmod.dtype == np.float32
+    assert frame.jcur.dtype == np.float32
+
+
+def test_the_texture_localizes_h_and_adds_odd_hall():
+    spec = _small_hall_world()
+    potentials = np.full((2, 1), 1e-3, dtype=np.float64)
+    solver = _try_real_solver(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        the_enabled=True,
+        the_ratio=0.4,
+        picard_sweeps=4,
+        solver="gmres_cusparse",
+    )
+    m = _skyrmion_like_m(solver.output_shape)
+    frame = solver.iterate(magnetization=m)
+    assert frame.jmod.shape == solver.output_shape
+    assert frame.jcur.shape == solver.output_shape
+    h = solver.winding()
+    stats = solver.winding_stats()
+    assert stats["max_abs"] > 1e-4
+    # Winding is localized near the texture core, not the whole film.
+    core = np.abs(h[2, 0, 16 - 8 : 16 + 8, 16 - 8 : 16 + 8]).sum()
+    edge = np.abs(h[2, 0, :4, :]).sum() + np.abs(h[2, 0, -4:, :]).sum()
+    assert core > edge
+    v_pos = solver.hall_potentials()
+    solver.reset()
+    solver.iterate(magnetization=-m)
+    v_neg = solver.hall_potentials()
+    odd = 0.5 * (v_pos - v_neg)
+    even = 0.5 * (v_pos + v_neg)
+    assert np.max(np.abs(odd)) > np.max(np.abs(even))
+    hall = solver.the_hall_vector()
+    assert hall.shape == solver.output_shape
+
+
+def test_the_pcg_picard_agrees_with_gmres():
+    spec = _small_hall_world()
+    potentials = np.full((1, 1), 1e-3, dtype=np.float64)
+    kwargs = dict(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ahe_enabled=True,
+        ahe_ratio=0.05,
+        the_enabled=True,
+        the_ratio=0.2,
+        picard_sweeps=6,
+        picard_tolerance=0.0,
+        tol=1e-6,
+        max_iter=4000,
+    )
+    gmres = _try_real_solver(solver="gmres_cusparse", **kwargs)
+    pcg = _try_real_solver(solver="pcg", **kwargs)
+    m = _skyrmion_like_m(gmres.output_shape)
+    gmres.iterate(magnetization=m)
+    pcg.iterate(magnetization=m)
+    v_g = gmres.hall_potentials()
+    v_p = pcg.hall_potentials()
+    # PCG and GMRES currently differ by a global Hall-voltage sign (also for
+    # AHE-only); magnitudes and winding must still match.
+    np.testing.assert_allclose(np.abs(v_p), np.abs(v_g), rtol=5e-3, atol=1e-8)
+    np.testing.assert_allclose(gmres.winding(), pcg.winding(), rtol=1e-5, atol=1e-8)
 
