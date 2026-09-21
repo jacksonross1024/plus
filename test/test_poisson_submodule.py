@@ -30,12 +30,18 @@ class _FakeImpl:
         self.amr_enabled = False
         self.ahe_enabled = False
         self.the_enabled = False
+        self.ohe_enabled = True
+        self.resistivity_invert = False
+        self.magnetization_required = False
         self.amr_ratio = 0.0
         self.ahe_ratio = 0.0
         self.the_ratio = 0.0
+        self.hall_coefficient_pt = -2.44e-11
+        self.hall_coefficient_fm = 3.09e-10
         self.picard_sweeps = 2
         self.fm_layer_count = nz
         self.last_magnetization = None
+        self.last_applied_field = None
         self._hall_high = None
         self._hall_low = None
         self._hall_voltages = None
@@ -125,7 +131,7 @@ class _FakeImpl:
     def iterate(self):
         step = self.current_step
         skipped, frame = self._frame_for_step(step)
-        if self.transport_enabled and not skipped:
+        if self.magnetization_required and not skipped:
             raise RuntimeError(
                 "magnetization is required when AMR/AHE/THE transport is enabled"
             )
@@ -173,6 +179,12 @@ class _FakeImpl:
             },
         }
 
+    def set_applied_field_uniform(self, bx, by, bz):
+        self.last_applied_field = (float(bx), float(by), float(bz))
+
+    def set_applied_field_grid(self, applied_field):
+        self.last_applied_field = np.asarray(applied_field)
+
 
 class _FakeRawPoissonCudaSolver:
     last_from_arrays = None
@@ -198,30 +210,50 @@ class _FakeRawPoissonCudaSolver:
         the_ratio=0.0,
         picard_sweeps=2,
         picard_tolerance=0.0,
+        ohe_enabled=True,
+        hall_coefficient_pt=-2.44e-11,
+        hall_coefficient_fm=3.09e-10,
+        resistivity_invert=False,
         solver="pcg",
-        gmres_restart=50,
+        gmres_restart=200,
+        voltage_scale_guess=False,
+        preconditioner="jacobi",
     ):
         impl = _FakeImpl(contact_potentials)
         impl.amr_enabled = bool(amr_enabled)
         impl.ahe_enabled = bool(ahe_enabled)
         impl.the_enabled = bool(the_enabled)
+        impl.ohe_enabled = bool(ohe_enabled)
         impl.amr_ratio = float(amr_ratio)
         impl.ahe_ratio = float(ahe_ratio)
         impl.the_ratio = float(the_ratio)
+        impl.hall_coefficient_pt = float(hall_coefficient_pt)
+        impl.hall_coefficient_fm = float(hall_coefficient_fm)
+        impl.resistivity_invert = bool(resistivity_invert)
         impl.picard_sweeps = int(picard_sweeps)
         impl.solver = solver
-        impl.gmres_restart = int(gmres_restart)
-        impl.transport_enabled = bool(amr_enabled or ahe_enabled or the_enabled)
+        impl.gmres_restart = gmres_restart
+        impl.voltage_scale_guess = bool(voltage_scale_guess)
+        impl.preconditioner = str(preconditioner)
+        impl.magnetization_required = bool(amr_enabled or ahe_enabled or the_enabled)
+        impl.transport_enabled = bool(amr_enabled or ahe_enabled or the_enabled or ohe_enabled)
         _FakeRawPoissonCudaSolver.last_transport = {
             "amr_enabled": impl.amr_enabled,
             "ahe_enabled": impl.ahe_enabled,
             "the_enabled": impl.the_enabled,
+            "ohe_enabled": impl.ohe_enabled,
             "amr_ratio": impl.amr_ratio,
             "ahe_ratio": impl.ahe_ratio,
             "the_ratio": impl.the_ratio,
+            "hall_coefficient_pt": impl.hall_coefficient_pt,
+            "hall_coefficient_fm": impl.hall_coefficient_fm,
+            "resistivity_invert": impl.resistivity_invert,
             "picard_sweeps": impl.picard_sweeps,
             "solver": impl.solver,
             "gmres_restart": impl.gmres_restart,
+            "voltage_scale_guess": impl.voltage_scale_guess,
+            "preconditioner": impl.preconditioner,
+            "tolerance": tolerance,
         }
         return impl
 
@@ -256,8 +288,14 @@ class _FakeRawPoissonCudaSolver:
         the_ratio=0.0,
         picard_sweeps=2,
         picard_tolerance=0.0,
+        ohe_enabled=True,
+        hall_coefficient_pt=-2.44e-11,
+        hall_coefficient_fm=3.09e-10,
+        resistivity_invert=False,
         solver="pcg",
-        gmres_restart=50,
+        gmres_restart=200,
+        voltage_scale_guess=False,
+        preconditioner="jacobi",
     ):
         _FakeRawPoissonCudaSolver.last_from_arrays = {
             "shape": (nz, ny, nx),
@@ -275,23 +313,37 @@ class _FakeRawPoissonCudaSolver:
         impl.amr_enabled = bool(amr_enabled)
         impl.ahe_enabled = bool(ahe_enabled)
         impl.the_enabled = bool(the_enabled)
+        impl.ohe_enabled = bool(ohe_enabled)
         impl.amr_ratio = float(amr_ratio)
         impl.ahe_ratio = float(ahe_ratio)
         impl.the_ratio = float(the_ratio)
+        impl.hall_coefficient_pt = float(hall_coefficient_pt)
+        impl.hall_coefficient_fm = float(hall_coefficient_fm)
+        impl.resistivity_invert = bool(resistivity_invert)
         impl.picard_sweeps = int(picard_sweeps)
         impl.solver = solver
-        impl.gmres_restart = int(gmres_restart)
-        impl.transport_enabled = bool(amr_enabled or ahe_enabled or the_enabled)
+        impl.gmres_restart = gmres_restart
+        impl.voltage_scale_guess = bool(voltage_scale_guess)
+        impl.preconditioner = str(preconditioner)
+        impl.magnetization_required = bool(amr_enabled or ahe_enabled or the_enabled)
+        impl.transport_enabled = bool(amr_enabled or ahe_enabled or the_enabled or ohe_enabled)
         _FakeRawPoissonCudaSolver.last_transport = {
             "amr_enabled": impl.amr_enabled,
             "ahe_enabled": impl.ahe_enabled,
             "the_enabled": impl.the_enabled,
+            "ohe_enabled": impl.ohe_enabled,
             "amr_ratio": impl.amr_ratio,
             "ahe_ratio": impl.ahe_ratio,
             "the_ratio": impl.the_ratio,
+            "hall_coefficient_pt": impl.hall_coefficient_pt,
+            "hall_coefficient_fm": impl.hall_coefficient_fm,
+            "resistivity_invert": impl.resistivity_invert,
             "picard_sweeps": impl.picard_sweeps,
             "solver": impl.solver,
             "gmres_restart": impl.gmres_restart,
+            "voltage_scale_guess": impl.voltage_scale_guess,
+            "preconditioner": impl.preconditioner,
+            "tolerance": tolerance,
         }
         return impl
 
@@ -314,6 +366,7 @@ def fake_raw_solver(monkeypatch):
 def test_poisson_submodule_imports():
     assert hasattr(poisson, "CudaPoissonSolver")
     assert hasattr(poisson, "WorldSpec")
+    assert hasattr(poisson, "HallPotentialLayers")
 
 
 def test_default_world_path_is_packaged():
@@ -535,16 +588,27 @@ def test_world_spec_uses_in_memory_arrays(fake_raw_solver):
     assert fake_raw_solver.last_from_arrays["sigma_dtype"] == np.dtype("float32")
 
 
-def test_transport_defaults_off(fake_raw_solver):
+def test_transport_defaults_include_ohe(fake_raw_solver):
     solver = poisson.CudaPoissonSolver(contact_potentials=np.zeros((1, 3)))
-    assert not solver.transport_enabled
+    assert solver.transport_enabled
+    assert solver.ohe_enabled
     assert not solver.amr_enabled
     assert not solver.ahe_enabled
     assert not solver.the_enabled
+    assert not solver.magnetization_required
     assert solver.solver == "gmres_cusparse"
+    assert solver.hall_coefficient_pt == pytest.approx(-2.44e-11)
+    assert solver.hall_coefficient_fm == pytest.approx(3.09e-10)
+    assert fake_raw_solver.last_transport["ohe_enabled"] is True
     assert fake_raw_solver.last_transport["amr_enabled"] is False
     assert fake_raw_solver.last_transport["ahe_enabled"] is False
     assert fake_raw_solver.last_transport["the_enabled"] is False
+    assert fake_raw_solver.last_transport["gmres_restart"] == 200
+    assert fake_raw_solver.last_transport["voltage_scale_guess"] is False
+    assert fake_raw_solver.last_transport["preconditioner"] == "jacobi"
+    assert fake_raw_solver.last_transport["resistivity_invert"] is False
+    assert fake_raw_solver.last_transport["tolerance"] == pytest.approx(1e-6)
+    assert not solver.resistivity_invert
 
 
 def test_solver_option_forwards_to_native(fake_raw_solver):
@@ -558,6 +622,54 @@ def test_solver_option_forwards_to_native(fake_raw_solver):
     assert solver.solver == "gmres_cusparse"
     assert fake_raw_solver.last_transport["solver"] == "gmres_cusparse"
     assert fake_raw_solver.last_transport["gmres_restart"] == 24
+
+
+def test_preconditioner_and_restart_list_forward_to_native(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.zeros((1, 3)),
+        solver="gmres_cusparse",
+        preconditioner="gmg",
+        gmres_restart=(50, 0, 0, 200),
+    )
+    assert solver.preconditioner == "gmg"
+    assert solver.gmres_restart == (50, 0, 0, 200)
+    assert fake_raw_solver.last_transport["preconditioner"] == "gmg"
+    assert fake_raw_solver.last_transport["gmres_restart"] == [50, 0, 0, 200]
+
+
+def test_resistivity_invert_forwards_to_native(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.zeros((1, 3)),
+        resistivity_invert=True,
+    )
+    assert solver.resistivity_invert
+    assert fake_raw_solver.last_transport["resistivity_invert"] is True
+
+
+def test_preconditioner_gmg_requires_gmres(fake_raw_solver):
+    with pytest.raises(ValueError, match="preconditioner='gmg'"):
+        poisson.CudaPoissonSolver(
+            contact_potentials=np.zeros((1, 3)),
+            solver="pcg",
+            preconditioner="gmg",
+        )
+
+
+def test_gmres_restart_rejects_one(fake_raw_solver):
+    with pytest.raises(ValueError, match="gmres_restart"):
+        poisson.CudaPoissonSolver(
+            contact_potentials=np.zeros((1, 3)),
+            gmres_restart=1,
+        )
+
+
+def test_voltage_scale_guess_forwards_to_native(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.zeros((1, 3)),
+        voltage_scale_guess=True,
+    )
+    assert solver.voltage_scale_guess is True
+    assert fake_raw_solver.last_transport["voltage_scale_guess"] is True
 
 
 def test_solver_option_validation(fake_raw_solver):
@@ -827,6 +939,27 @@ def test_resolve_hall_contact_geometry_mirrors_drive_contacts():
             assert contact_id[iz, iy, ix] == 0
 
 
+def test_resolve_hall_contact_geometry_z_modes():
+    spec = poisson.build_fgat_world_spec(
+        num_contacts=2,
+        shape=(4, 64, 64),
+        cellsize=(5e-9, 5e-9, 5e-9),
+        contact_layout="manual",
+        contact_size_cells=10,
+        contact_spacing_cells=10,
+        contact_edge_depth_cells=10,
+        void_locations=None,
+    )
+    geom_c = poisson.resolve_hall_contact_geometry(spec, z_mode="contact")
+    geom_pt = poisson.resolve_hall_contact_geometry(spec, z_mode="pt")
+    geom_fm = poisson.resolve_hall_contact_geometry(spec, z_mode="fm")
+    assert geom_c.z_layers == (0, 1)
+    assert geom_pt.z_layers == (0, 1)
+    assert geom_fm.z_layers == (2, 3)
+    with pytest.raises(ValueError, match="cannot build a single"):
+        poisson.resolve_hall_contact_geometry(spec, z_mode="both")
+
+
 def test_hall_potentials_helper_with_fake_impl(fake_raw_solver):
     spec = poisson.build_fgat_world_spec(
         num_contacts=2,
@@ -863,6 +996,57 @@ def test_hall_potentials_helper_with_fake_impl(fake_raw_solver):
     assert isinstance(comps, poisson.HallPotentialResult)
     np.testing.assert_allclose(comps.voltages, v)
     assert comps.geometry.num_contacts == 2
+
+
+def test_hall_layer_potentials_both_are_independent_arrays(fake_raw_solver):
+    spec = poisson.build_fgat_world_spec(
+        num_contacts=2,
+        shape=(4, 64, 64),
+        cellsize=(5e-9, 5e-9, 5e-9),
+        contact_layout="manual",
+        contact_size_cells=10,
+        contact_spacing_cells=10,
+        contact_edge_depth_cells=10,
+        void_locations=None,
+    )
+    potentials = np.array([[1e-3, 2e-3]], dtype=np.float64)
+    solver = poisson.CudaPoissonSolver(world=spec, contact_potentials=potentials)
+    solver.iterate()
+
+    layers = solver.hall_layer_potentials("both")
+    assert isinstance(layers, poisson.HallPotentialLayers)
+    assert layers.locations == ("contact", "fm")
+    assert layers.pt is None
+    assert layers.contact is not None and layers.fm is not None
+    assert layers.contact.shape == (2,)
+    assert layers.fm.shape == (2,)
+    assert layers.contact is not layers.fm
+    v_contact = solver.hall_potentials(z_mode="contact")
+    v_fm = solver.hall_potentials(z_mode="fm")
+    np.testing.assert_allclose(layers.contact, v_contact)
+    np.testing.assert_allclose(layers.fm, v_fm)
+    np.testing.assert_allclose(layers["contact"], v_contact)
+    np.testing.assert_allclose(layers["fm"], v_fm)
+
+    via_z_mode = solver.hall_potentials(z_mode="both")
+    assert isinstance(via_z_mode, poisson.HallPotentialLayers)
+    np.testing.assert_allclose(via_z_mode.contact, v_contact)
+    np.testing.assert_allclose(via_z_mode.fm, v_fm)
+
+    fm_only = solver.hall_layer_potentials("fm")
+    assert fm_only.contact is None
+    assert fm_only.pt is None
+    np.testing.assert_allclose(fm_only.fm, v_fm)
+
+    both_comps = solver.hall_layer_potentials("both", return_components=True)
+    assert both_comps.contact_result is not None
+    assert both_comps.fm_result is not None
+    assert both_comps.contact_result.geometry.z_layers == (0, 1)
+    assert both_comps.fm_result.geometry.z_layers == (2, 3)
+    assert both_comps.contact_result.geometry.z_layers != both_comps.fm_result.geometry.z_layers
+
+    with pytest.raises(ValueError, match="auto z selections"):
+        solver.hall_layer_potentials("both", geometry=both_comps.contact_result.geometry)
 
 
 def test_hall_potentials_skipped_frame_returns_zeros(fake_raw_solver):
@@ -1043,4 +1227,330 @@ def test_the_pcg_picard_agrees_with_gmres():
     # AHE-only); magnitudes and winding must still match.
     np.testing.assert_allclose(np.abs(v_p), np.abs(v_g), rtol=5e-3, atol=1e-8)
     np.testing.assert_allclose(gmres.winding(), pcg.winding(), rtol=1e-5, atol=1e-8)
+
+
+def _ohe_random_contact_world():
+    return poisson.build_fgat_world_spec(
+        num_contacts=2,
+        shape=(4, 32, 32),
+        cellsize=(5e-9, 5e-9, 5e-9),
+        contact_layout="manual",
+        contact_size_cells=8,
+        contact_spacing_cells=6,
+        contact_edge_depth_cells=4,
+        void_locations=None,
+    )
+
+
+def _random_contact_potentials(n_frames, n_contacts, seed=12345):
+    rng = np.random.default_rng(seed)
+    potentials = rng.uniform(-2.5e-3, 2.5e-3, size=(n_frames, n_contacts))
+    potentials[np.abs(potentials) < 4e-4] = 1.2e-3
+    return np.ascontiguousarray(potentials, dtype=np.float64)
+
+
+@pytest.mark.parametrize("tol", [1e-6, 1e-7])
+def test_ohe_random_contacts_sat_m_pt_and_fm_probes(tol):
+    spec = _ohe_random_contact_world()
+    potentials = _random_contact_potentials(2, spec.contact_id.max())
+    solver = _try_real_solver(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ohe_enabled=True,
+        ahe_enabled=False,
+        the_enabled=False,
+        amr_enabled=False,
+        tol=tol,
+        gmres_restart=200,
+        max_iter=4000,
+        solver="gmres_cusparse",
+    )
+    m = _uniform_m(solver.output_shape, axis=2)
+    bz = 0.15
+
+    def hall_pt_fm():
+        v_pt = solver.hall_potentials(z_mode="pt")
+        v_fm = solver.hall_potentials(z_mode="fm")
+        return v_pt, v_fm
+
+    solver.set_applied_field((0.0, 0.0, 0.0))
+    frame0 = solver.iterate(magnetization=m)
+    assert not frame0.stats.skipped
+    assert frame0.stats.residual_rel <= 50.0 * tol
+    v0_pt, v0_fm = hall_pt_fm()
+
+    solver.reset()
+    solver.iterate(magnetization=m, applied_field=(0.0, 0.0, bz))
+    vp_pt, vp_fm = hall_pt_fm()
+
+    solver.reset()
+    solver.iterate(magnetization=m, applied_field=(0.0, 0.0, -bz))
+    vn_pt, vn_fm = hall_pt_fm()
+
+    odd_pt = 0.5 * (vp_pt - vn_pt)
+    even_pt = 0.5 * (vp_pt + vn_pt)
+    odd_fm = 0.5 * (vp_fm - vn_fm)
+    even_fm = 0.5 * (vp_fm + vn_fm)
+
+    # Literature R_H at 0.15 T gives a nV-scale Hall voltage on this mesh.
+    assert np.max(np.abs(odd_pt)) > np.max(np.abs(even_pt - v0_pt))
+    assert np.max(np.abs(odd_fm)) > np.max(np.abs(even_fm - v0_fm))
+    assert np.max(np.abs(odd_pt)) > 1e-10
+    assert np.max(np.abs(odd_fm)) > 1e-10
+    np.testing.assert_allclose(even_pt, v0_pt, rtol=0.2, atol=1e-10)
+    np.testing.assert_allclose(even_fm, v0_fm, rtol=0.2, atol=1e-10)
+    np.testing.assert_allclose(vp_pt - v0_pt, -(vn_pt - v0_pt), rtol=0.2, atol=1e-10)
+    np.testing.assert_allclose(vp_fm - v0_fm, -(vn_fm - v0_fm), rtol=0.2, atol=1e-10)
+
+    solver.reset()
+    solver.iterate(magnetization=-m, applied_field=(0.0, 0.0, bz))
+    vm_pt, vm_fm = hall_pt_fm()
+    np.testing.assert_allclose(vm_pt, vp_pt, rtol=1e-3, atol=1e-9)
+    np.testing.assert_allclose(vm_fm, vp_fm, rtol=1e-3, atol=1e-9)
+
+    solver.reset()
+    frame1 = solver.iterate(magnetization=m, applied_field=(0.0, 0.0, bz))
+    assert not frame1.stats.skipped
+    solver.iterate(magnetization=m, applied_field=(0.0, 0.0, bz))
+    v2_pt = solver.hall_potentials(z_mode="pt")
+    v2_fm = solver.hall_potentials(z_mode="fm")
+    assert v2_pt.shape == (2,)
+    assert v2_fm.shape == (2,)
+    assert np.max(np.abs(v2_pt)) > 0.0
+    assert np.max(np.abs(v2_fm)) > 0.0
+    layers = solver.hall_layer_potentials(("pt", "fm"))
+    np.testing.assert_allclose(layers.pt, v2_pt)
+    np.testing.assert_allclose(layers.fm, v2_fm)
+    assert layers.contact is None
+
+
+def test_ohe_b_zero_matches_ohe_disabled():
+    spec = _ohe_random_contact_world()
+    potentials = _random_contact_potentials(1, spec.contact_id.max(), seed=7)
+    common = dict(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ahe_enabled=False,
+        the_enabled=False,
+        amr_enabled=False,
+        tol=1e-6,
+        gmres_restart=200,
+        solver="gmres_cusparse",
+    )
+    with_ohe = _try_real_solver(ohe_enabled=True, **common)
+    without = _try_real_solver(ohe_enabled=False, **common)
+    m = _uniform_m(with_ohe.output_shape, axis=2)
+    with_ohe.iterate(magnetization=m, applied_field=(0.0, 0.0, 0.0))
+    without.iterate(magnetization=m)
+    np.testing.assert_allclose(
+        with_ohe.hall_potentials(z_mode="pt"),
+        without.hall_potentials(z_mode="pt"),
+        rtol=1e-4,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        with_ohe.hall_potentials(z_mode="fm"),
+        without.hall_potentials(z_mode="fm"),
+        rtol=1e-4,
+        atol=1e-9,
+    )
+
+
+def test_applied_field_forwards_to_native(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(contact_potentials=np.zeros((1, 3)))
+    solver.set_applied_field((0.0, 0.1, 0.2))
+    np.testing.assert_allclose(solver._impl.last_applied_field, (0.0, 0.1, 0.2), atol=1e-6)
+
+
+def _void_cutout_world():
+    return poisson.build_fgat_world_spec(
+        num_contacts=1,
+        shape=(4, 32, 32),
+        cellsize=(5e-9, 5e-9, 5e-9),
+        contact_layout="manual",
+        contact_size_cells=10,
+        contact_edge_depth_cells=10,
+        void_locations=[(0.5, 0.5)],
+        void_radius=20e-9,
+    )
+
+
+def test_gmg_matches_jacobi_on_two_textured_fields():
+    spec = _void_cutout_world()
+    potentials = np.full((2, 1), 1e-3, dtype=np.float64)
+    common = dict(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        amr_enabled=True,
+        amr_ratio=0.1,
+        ahe_enabled=True,
+        ahe_ratio=0.05,
+        the_enabled=True,
+        the_ratio=0.2,
+        ohe_enabled=True,
+        tol=1e-6,
+        max_iter=4000,
+        solver="gmres_cusparse",
+        gmres_restart=32,
+    )
+    jacobi = _try_real_solver(preconditioner="jacobi", **common)
+    gmg = _try_real_solver(preconditioner="gmg", **common)
+    assert gmg.preconditioner == "gmg"
+    assert gmg._impl.gmg_n_levels >= 2
+    assert gmg._impl.gmg_void_sparsity_ok is True
+    m0 = _skyrmion_like_m(jacobi.output_shape)
+    m1 = _uniform_m(jacobi.output_shape, axis=1)
+
+    frame0 = jacobi.iterate(magnetization=m0, applied_field=(0.0, 0.0, 0.05))
+    gframe0 = gmg.iterate(magnetization=m0, applied_field=(0.0, 0.0, 0.05))
+    assert not frame0.stats.skipped
+    assert not gframe0.stats.skipped
+    assert gframe0.stats.residual_rel <= 50.0 * common["tol"]
+    assert "gmg" in gframe0.stats.note
+    v0_j = jacobi.hall_potentials()
+    v0_g = gmg.hall_potentials()
+    np.testing.assert_allclose(v0_j, v0_g, rtol=5e-3, atol=1e-8)
+
+    jacobi.iterate(magnetization=m1, applied_field=(0.0, 0.0, 0.05))
+    gframe1 = gmg.iterate(magnetization=m1, applied_field=(0.0, 0.0, 0.05))
+    assert "gmg" in gframe1.stats.note
+    v1_j = jacobi.hall_potentials()
+    v1_g = gmg.hall_potentials()
+    np.testing.assert_allclose(v1_j, v1_g, rtol=5e-3, atol=1e-8)
+    assert np.max(np.abs(v1_g - v0_g)) > 1e-10
+
+
+def test_resistivity_invert_amr_only_matches_additive():
+    spec = _small_hall_world()
+    potentials = np.full((1, 1), 1e-3, dtype=np.float64)
+    common = dict(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        amr_enabled=True,
+        amr_ratio=0.1,
+        ahe_enabled=False,
+        the_enabled=False,
+        ohe_enabled=False,
+        tol=1e-6,
+        solver="gmres_cusparse",
+    )
+    additive = _try_real_solver(resistivity_invert=False, **common)
+    inverted = _try_real_solver(resistivity_invert=True, **common)
+    assert inverted.resistivity_invert
+    m = _uniform_m(additive.output_shape, axis=0)
+    f_add = additive.iterate(magnetization=m)
+    f_inv = inverted.iterate(magnetization=m)
+    np.testing.assert_allclose(
+        inverted.hall_potentials(),
+        additive.hall_potentials(),
+        rtol=1e-4,
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(f_inv.jcur, f_add.jcur, rtol=1e-4, atol=1e-8)
+
+
+def test_resistivity_invert_small_ahe_matches_additive_to_theta2():
+    spec = _small_hall_world()
+    potentials = np.full((1, 1), 1e-3, dtype=np.float64)
+    theta = 0.02
+    common = dict(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ahe_enabled=True,
+        ahe_ratio=theta,
+        the_enabled=False,
+        ohe_enabled=False,
+        amr_enabled=False,
+        tol=1e-6,
+        solver="gmres_cusparse",
+    )
+    additive = _try_real_solver(resistivity_invert=False, **common)
+    inverted = _try_real_solver(resistivity_invert=True, **common)
+    m = _uniform_m(additive.output_shape, axis=2)
+    additive.iterate(magnetization=m)
+    inverted.iterate(magnetization=m)
+    v_add = additive.hall_potentials()
+    v_inv = inverted.hall_potentials()
+    scale = np.max(np.abs(v_add))
+    assert scale > 0.0
+    np.testing.assert_allclose(v_inv, v_add, rtol=20.0 * theta * theta, atol=1e-10 + 20.0 * theta * theta * scale)
+
+
+def test_resistivity_invert_m_negation_flips_hall():
+    spec = _small_hall_world()
+    potentials = np.full((1, 1), 1e-3, dtype=np.float64)
+    solver = _try_real_solver(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ahe_enabled=True,
+        ahe_ratio=0.05,
+        ohe_enabled=False,
+        the_enabled=False,
+        resistivity_invert=True,
+        solver="gmres_cusparse",
+    )
+    m = _uniform_m(solver.output_shape, axis=2)
+    solver.iterate(magnetization=m)
+    v_plus = solver.hall_potentials()
+    solver.reset()
+    solver.iterate(magnetization=-m)
+    v_minus = solver.hall_potentials()
+    np.testing.assert_allclose(v_minus, -v_plus, rtol=1e-3, atol=1e-10)
+    assert np.max(np.abs(v_plus)) > 0.0
+
+
+def test_resistivity_invert_b_negation_flips_ohe_only():
+    spec = _small_hall_world()
+    potentials = np.full((1, 1), 1e-3, dtype=np.float64)
+    solver = _try_real_solver(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ahe_enabled=False,
+        the_enabled=False,
+        amr_enabled=False,
+        ohe_enabled=True,
+        resistivity_invert=True,
+        solver="gmres_cusparse",
+    )
+    m = _uniform_m(solver.output_shape, axis=2)
+    solver.iterate(magnetization=m, applied_field=(0.0, 0.0, 0.15))
+    v_plus = solver.hall_potentials()
+    solver.reset()
+    solver.iterate(magnetization=m, applied_field=(0.0, 0.0, -0.15))
+    v_minus = solver.hall_potentials()
+    np.testing.assert_allclose(v_minus, -v_plus, rtol=1e-3, atol=1e-10)
+    assert np.max(np.abs(v_plus)) > 0.0
+
+
+def test_resistivity_invert_uniform_m_the_matches_ahe_ohe():
+    spec = _small_hall_world()
+    potentials = np.full((1, 1), 1e-3, dtype=np.float64)
+    common = dict(
+        world=spec,
+        contact_potentials=potentials,
+        skip_threshold=0.0,
+        ahe_enabled=True,
+        ahe_ratio=0.05,
+        ohe_enabled=True,
+        resistivity_invert=True,
+        solver="gmres_cusparse",
+    )
+    without_the = _try_real_solver(the_enabled=False, **common)
+    with_the = _try_real_solver(the_enabled=True, the_ratio=0.2, **common)
+    m = _uniform_m(without_the.output_shape, axis=2)
+    without_the.iterate(magnetization=m, applied_field=(0.0, 0.0, 0.05))
+    with_the.iterate(magnetization=m, applied_field=(0.0, 0.0, 0.05))
+    np.testing.assert_allclose(
+        with_the.hall_potentials(),
+        without_the.hall_potentials(),
+        rtol=1e-4,
+        atol=1e-10,
+    )
 

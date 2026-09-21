@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include <pybind11/stl.h>
+
 #include "field.hpp"
 #include "poisson_cuda_session.hpp"
 #include "variable.hpp"
@@ -77,7 +79,11 @@ TransportConfig transport_from_args(bool amr_enabled,
                                     bool the_enabled,
                                     double the_ratio,
                                     int picard_sweeps,
-                                    double picard_tolerance) {
+                                    double picard_tolerance,
+                                    bool ohe_enabled,
+                                    double hall_coefficient_pt,
+                                    double hall_coefficient_fm,
+                                    bool resistivity_invert) {
   TransportConfig cfg;
   cfg.amr_enabled = amr_enabled;
   cfg.amr_ratio = amr_ratio;
@@ -87,6 +93,10 @@ TransportConfig transport_from_args(bool amr_enabled,
   cfg.the_ratio = the_ratio;
   cfg.picard_sweeps = picard_sweeps;
   cfg.picard_tolerance = picard_tolerance;
+  cfg.ohe_enabled = ohe_enabled;
+  cfg.hall_coefficient_pt = hall_coefficient_pt;
+  cfg.hall_coefficient_fm = hall_coefficient_fm;
+  cfg.resistivity_invert = resistivity_invert;
   return cfg;
 }
 
@@ -108,6 +118,40 @@ std::string solver_kind_to_string(PoissonLinearSolverKind solver) {
       return "gmres_cusparse";
   }
   return "unknown";
+}
+
+PoissonPreconditionerKind preconditioner_kind_from_string(const std::string& name) {
+  if (name == "jacobi") {
+    return PoissonPreconditionerKind::kJacobi;
+  }
+  if (name == "gmg") {
+    return PoissonPreconditionerKind::kGmg;
+  }
+  throw std::invalid_argument("poisson preconditioner must be 'jacobi' or 'gmg'");
+}
+
+std::string preconditioner_kind_to_string(PoissonPreconditionerKind kind) {
+  switch (kind) {
+    case PoissonPreconditionerKind::kJacobi:
+      return "jacobi";
+    case PoissonPreconditionerKind::kGmg:
+      return "gmg";
+  }
+  return "unknown";
+}
+
+std::vector<int> gmres_restart_from_object(const py::object& obj) {
+  if (py::isinstance<py::int_>(obj)) {
+    return {obj.cast<int>()};
+  }
+  std::vector<int> out;
+  for (const py::handle item : obj) {
+    out.push_back(py::cast<int>(item));
+  }
+  if (out.empty()) {
+    throw std::invalid_argument("gmres_restart sequence cannot be empty");
+  }
+  return out;
 }
 
 template <typename T>
@@ -368,19 +412,27 @@ void wrap_poisson_cuda(py::module& m) {
              double the_ratio,
              int picard_sweeps,
              double picard_tolerance,
+             bool ohe_enabled,
+             double hall_coefficient_pt,
+             double hall_coefficient_fm,
+             bool resistivity_invert,
              const std::string& solver,
-             int gmres_restart) {
+             py::object gmres_restart,
+             bool voltage_scale_guess,
+             const std::string& preconditioner) {
             return std::make_unique<PoissonCudaSession>(
                 PoissonWorld::load(manifest_path), contact_potentials_from_array(potentials_array),
                 tolerance, max_iterations, skip_threshold, slice_x, slice_y, slice_z,
                 cuda_tol_batch_first, cuda_tol_batch_next,
                 transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled,
-                                    the_ratio, picard_sweeps, picard_tolerance),
-                solver_kind_from_string(solver), gmres_restart);
+                                    the_ratio, picard_sweeps, picard_tolerance, ohe_enabled,
+                                    hall_coefficient_pt, hall_coefficient_fm, resistivity_invert),
+                solver_kind_from_string(solver), gmres_restart_from_object(gmres_restart),
+                voltage_scale_guess, preconditioner_kind_from_string(preconditioner));
           },
           py::arg("manifest_path"),
           py::arg("contact_potentials"),
-          py::arg("tolerance") = 1e-5,
+          py::arg("tolerance") = 1e-6,
           py::arg("max_iterations") = 2000,
           py::arg("skip_threshold") = 1e-5,
           py::arg("slice_x") = "",
@@ -396,8 +448,14 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("the_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
           py::arg("picard_tolerance") = 0.0,
+          py::arg("ohe_enabled") = true,
+          py::arg("hall_coefficient_pt") = -2.44e-11,
+          py::arg("hall_coefficient_fm") = 3.09e-10,
+          py::arg("resistivity_invert") = false,
           py::arg("solver") = "gmres_cusparse",
-          py::arg("gmres_restart") = 50)
+          py::arg("gmres_restart") = 200,
+          py::arg("voltage_scale_guess") = false,
+          py::arg("preconditioner") = "jacobi")
       .def_static(
           "from_arrays",
           [](int nx,
@@ -429,8 +487,14 @@ void wrap_poisson_cuda(py::module& m) {
              double the_ratio,
              int picard_sweeps,
              double picard_tolerance,
+             bool ohe_enabled,
+             double hall_coefficient_pt,
+             double hall_coefficient_fm,
+             bool resistivity_invert,
              const std::string& solver,
-             int gmres_restart) {
+             py::object gmres_restart,
+             bool voltage_scale_guess,
+             const std::string& preconditioner) {
             ManifestData meta;
             meta.nx = nx;
             meta.ny = ny;
@@ -452,8 +516,10 @@ void wrap_poisson_cuda(py::module& m) {
                 max_iterations, skip_threshold, slice_x, slice_y, slice_z, cuda_tol_batch_first,
                 cuda_tol_batch_next,
                 transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled,
-                                    the_ratio, picard_sweeps, picard_tolerance),
-                solver_kind_from_string(solver), gmres_restart);
+                                    the_ratio, picard_sweeps, picard_tolerance, ohe_enabled,
+                                    hall_coefficient_pt, hall_coefficient_fm, resistivity_invert),
+                solver_kind_from_string(solver), gmres_restart_from_object(gmres_restart),
+                voltage_scale_guess, preconditioner_kind_from_string(preconditioner));
           },
           py::arg("nx"),
           py::arg("ny"),
@@ -468,7 +534,7 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("contact_id"),
           py::arg("sigma"),
           py::arg("contact_potentials"),
-          py::arg("tolerance") = 1e-5,
+          py::arg("tolerance") = 1e-6,
           py::arg("max_iterations") = 2000,
           py::arg("skip_threshold") = 1e-5,
           py::arg("slice_x") = "",
@@ -484,8 +550,14 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("the_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
           py::arg("picard_tolerance") = 0.0,
+          py::arg("ohe_enabled") = true,
+          py::arg("hall_coefficient_pt") = -2.44e-11,
+          py::arg("hall_coefficient_fm") = 3.09e-10,
+          py::arg("resistivity_invert") = false,
           py::arg("solver") = "gmres_cusparse",
-          py::arg("gmres_restart") = 50)
+          py::arg("gmres_restart") = 200,
+          py::arg("voltage_scale_guess") = false,
+          py::arg("preconditioner") = "jacobi")
       .def_static(
           "from_signal_file",
           [](const std::string& manifest_path,
@@ -510,8 +582,14 @@ void wrap_poisson_cuda(py::module& m) {
              double the_ratio,
              int picard_sweeps,
              double picard_tolerance,
+             bool ohe_enabled,
+             double hall_coefficient_pt,
+             double hall_coefficient_fm,
+             bool resistivity_invert,
              const std::string& solver,
-             int gmres_restart) {
+             py::object gmres_restart,
+             bool voltage_scale_guess,
+             const std::string& preconditioner) {
             return std::make_unique<PoissonCudaSession>(
                 PoissonWorld::load(manifest_path),
                 load_signal_file_to_contact_potentials(signal_path, nt, v_scale, skip_first,
@@ -519,8 +597,10 @@ void wrap_poisson_cuda(py::module& m) {
                 tolerance, max_iterations, skip_threshold, slice_x, slice_y, slice_z,
                 cuda_tol_batch_first, cuda_tol_batch_next,
                 transport_from_args(amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled,
-                                    the_ratio, picard_sweeps, picard_tolerance),
-                solver_kind_from_string(solver), gmres_restart);
+                                    the_ratio, picard_sweeps, picard_tolerance, ohe_enabled,
+                                    hall_coefficient_pt, hall_coefficient_fm, resistivity_invert),
+                solver_kind_from_string(solver), gmres_restart_from_object(gmres_restart),
+                voltage_scale_guess, preconditioner_kind_from_string(preconditioner));
           },
           py::arg("manifest_path"),
           py::arg("signal_path"),
@@ -528,7 +608,7 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("v_scale") = 0.005,
           py::arg("skip_first") = 1000,
           py::arg("num_contacts") = 3,
-          py::arg("tolerance") = 1e-5,
+          py::arg("tolerance") = 1e-6,
           py::arg("max_iterations") = 2000,
           py::arg("skip_threshold") = 1e-5,
           py::arg("slice_x") = "",
@@ -544,8 +624,14 @@ void wrap_poisson_cuda(py::module& m) {
           py::arg("the_ratio") = 0.0,
           py::arg("picard_sweeps") = 2,
           py::arg("picard_tolerance") = 0.0,
+          py::arg("ohe_enabled") = true,
+          py::arg("hall_coefficient_pt") = -2.44e-11,
+          py::arg("hall_coefficient_fm") = 3.09e-10,
+          py::arg("resistivity_invert") = false,
           py::arg("solver") = "gmres_cusparse",
-          py::arg("gmres_restart") = 50)
+          py::arg("gmres_restart") = 200,
+          py::arg("voltage_scale_guess") = false,
+          py::arg("preconditioner") = "jacobi")
       .def("iterate", &iterate_to_dict)
       .def("iterate_with_magnetization", &iterate_with_magnetization_to_dict,
            py::arg("magnetization"))
@@ -556,6 +642,25 @@ void wrap_poisson_cuda(py::module& m) {
            py::arg("weight_hi"),
            py::arg("average_z") = false)
       .def("reset", &PoissonCudaSession::reset)
+      .def("set_applied_field_uniform", &PoissonCudaSession::set_applied_field_uniform,
+           py::arg("bx"), py::arg("by"), py::arg("bz"))
+      .def(
+          "set_applied_field_grid",
+          [](PoissonCudaSession& session,
+             py::array_t<float, py::array::c_style | py::array::forcecast> array) {
+            const py::buffer_info info = array.request();
+            if (info.ndim != 4 || info.shape[0] != 3 || info.shape[1] != session.nz() ||
+                info.shape[2] != session.ny() || info.shape[3] != session.nx()) {
+              throw std::invalid_argument(
+                  "applied_field must have shape (3, nz, ny, nx) matching the Poisson world");
+            }
+            const auto* data = static_cast<const float*>(info.ptr);
+            const std::size_t n = 3u * static_cast<std::size_t>(session.nz()) *
+                                  static_cast<std::size_t>(session.ny()) *
+                                  static_cast<std::size_t>(session.nx());
+            session.set_applied_field_grid(std::vector<float>(data, data + n));
+          },
+          py::arg("applied_field"))
       .def(
           "set_hall_probe_indices",
           [](PoissonCudaSession& session, py::list high_y, py::list low_y) {
@@ -608,10 +713,26 @@ void wrap_poisson_cuda(py::module& m) {
       .def_property_readonly("amr_enabled", &PoissonCudaSession::amr_enabled)
       .def_property_readonly("ahe_enabled", &PoissonCudaSession::ahe_enabled)
       .def_property_readonly("the_enabled", &PoissonCudaSession::the_enabled)
+      .def_property_readonly("ohe_enabled", &PoissonCudaSession::ohe_enabled)
+      .def_property_readonly("resistivity_invert", &PoissonCudaSession::resistivity_invert)
+      .def_property_readonly("magnetization_required",
+                             &PoissonCudaSession::magnetization_required)
       .def_property_readonly("amr_ratio", &PoissonCudaSession::amr_ratio)
       .def_property_readonly("ahe_ratio", &PoissonCudaSession::ahe_ratio)
       .def_property_readonly("the_ratio", &PoissonCudaSession::the_ratio)
+      .def_property_readonly("hall_coefficient_pt", &PoissonCudaSession::hall_coefficient_pt)
+      .def_property_readonly("hall_coefficient_fm", &PoissonCudaSession::hall_coefficient_fm)
       .def_property_readonly("picard_sweeps", &PoissonCudaSession::picard_sweeps)
+      .def_property_readonly("voltage_scale_guess", &PoissonCudaSession::voltage_scale_guess)
+      .def_property_readonly("preconditioner",
+                             [](const PoissonCudaSession& s) {
+                               return preconditioner_kind_to_string(s.preconditioner());
+                             })
+      .def_property_readonly("gmg_n_levels", &PoissonCudaSession::gmg_n_levels)
+      .def_property_readonly("gmg_unknown_counts", &PoissonCudaSession::gmg_unknown_counts)
+      .def_property_readonly("gmg_void_sparsity_ok", &PoissonCudaSession::gmg_void_sparsity_ok)
+      .def_property_readonly("gmres_restart_schedule",
+                             &PoissonCudaSession::gmres_restart_schedule)
       .def_property_readonly("solver",
                              [](const PoissonCudaSession& s) {
                                return solver_kind_to_string(s.solver_kind());

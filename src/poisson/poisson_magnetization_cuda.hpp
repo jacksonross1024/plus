@@ -32,3 +32,19 @@ void map_device_magnetization_to_host_stack(const float* d_mx,
                                             const std::vector<float>& weight_hi,
                                             bool average_z,
                                             std::vector<float>& out);
+
+// Map mumax device applied-field components onto the full Poisson grid
+// (3, dst_nz, ny, nx) including Pt, flattened as [bx | by | bz]. Same z-extend
+// style as magnetization, without unit-vector normalisation. Device-to-device.
+void map_device_applied_field_to_poisson_grid(const float* d_bx,
+                                              const float* d_by,
+                                              const float* d_bz,
+                                              int src_nz,
+                                              int ny,
+                                              int nx,
+                                              int dst_nz,
+                                              const int* d_src_lo,
+                                              const int* d_src_hi,
+                                              const float* d_weight_hi,
+                                              bool average_z,
+                                              float* d_out);

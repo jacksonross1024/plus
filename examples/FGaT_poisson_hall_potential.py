@@ -63,6 +63,14 @@ def main() -> None:
         action="store_true",
         help="force uniform m even when --the is set (THE fields should vanish)",
     )
+    parser.add_argument(
+        "--bz",
+        type=float,
+        default=0.15,
+        help="Uniform applied Bz [T] for ordinary Hall (0 disables OHE signal).",
+    )
+    parser.add_argument("--ohe", action="store_true", default=True, help=argparse.SUPPRESS)
+    parser.add_argument("--no-ohe", action="store_true", help="disable ordinary Hall")
     args = parser.parse_args()
 
     import mumaxplus.poisson as poisson
@@ -85,7 +93,11 @@ def main() -> None:
         ahe_ratio=args.ahe_ratio if args.ahe else 0.0,
         the_enabled=args.the,
         the_ratio=args.the_ratio if args.the else 0.0,
+        ohe_enabled=not args.no_ohe,
+        applied_field=(0.0, 0.0, args.bz),
         skip_threshold=0.0,
+        tol=1e-6,
+        gmres_restart=200,
     )
 
     geom = poisson.resolve_hall_contact_geometry(world)
@@ -116,6 +128,9 @@ def main() -> None:
     comps = solver.hall_potentials(return_components=True)
     print("high_y means [V]:", comps.high_y_means)
     print("low_y means [V]:", comps.low_y_means)
+    layers = solver.hall_layer_potentials("both")
+    print("Hall voltages contact [V]:", layers.contact)
+    print("Hall voltages FM [V]:", layers.fm)
 
     if args.the and m is not None:
         stats = solver.winding_stats()

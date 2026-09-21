@@ -82,6 +82,59 @@ __global__ void k_map_magnetization(const float* mx_in,
   out[2 * n_xy + idx] = mz;
 }
 
+__global__ void k_map_applied_field(const float* bx_in,
+                                    const float* by_in,
+                                    const float* bz_in,
+                                    int src_nz,
+                                    int ny,
+                                    int nx,
+                                    int dst_nz,
+                                    const int* src_lo,
+                                    const int* src_hi,
+                                    const float* weight_hi,
+                                    bool average_z,
+                                    float* out) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int plane = ny * nx;
+  const int total = dst_nz * plane;
+  if (idx >= total) {
+    return;
+  }
+
+  const int iz = idx / plane;
+  const int xy = idx - iz * plane;
+  float bx = 0.0f;
+  float by = 0.0f;
+  float bz = 0.0f;
+
+  if (average_z) {
+    for (int z = 0; z < src_nz; ++z) {
+      const int src = z * plane + xy;
+      bx += bx_in[src];
+      by += by_in[src];
+      bz += bz_in[src];
+    }
+    const float inv = 1.0f / static_cast<float>(src_nz);
+    bx *= inv;
+    by *= inv;
+    bz *= inv;
+  } else {
+    const int lo = src_lo[iz];
+    const int hi = src_hi[iz];
+    const float wh = weight_hi[iz];
+    const int src0 = lo * plane + xy;
+    const int src1 = hi * plane + xy;
+    const float wl = 1.0f - wh;
+    bx = wl * bx_in[src0] + wh * bx_in[src1];
+    by = wl * by_in[src0] + wh * by_in[src1];
+    bz = wl * bz_in[src0] + wh * bz_in[src1];
+  }
+
+  out[idx] = bx;
+  out[total + idx] = by;
+  out[2 * total + idx] = bz;
+}
+
 }  // namespace
 
 void map_device_magnetization_to_device_stack(const float* d_mx,
@@ -103,6 +156,27 @@ void map_device_magnetization_to_device_stack(const float* d_mx,
   k_map_magnetization<<<blocks, threads>>>(d_mx, d_my, d_mz, src_nz, ny, nx, dst_nz, d_src_lo,
                                            d_src_hi, d_weight_hi, average_z, d_out);
   check_cuda(cudaGetLastError(), "k_map_magnetization launch");
+}
+
+void map_device_applied_field_to_poisson_grid(const float* d_bx,
+                                              const float* d_by,
+                                              const float* d_bz,
+                                              int src_nz,
+                                              int ny,
+                                              int nx,
+                                              int dst_nz,
+                                              const int* d_src_lo,
+                                              const int* d_src_hi,
+                                              const float* d_weight_hi,
+                                              bool average_z,
+                                              float* d_out) {
+  const int plane = ny * nx;
+  const int total = dst_nz * plane;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  k_map_applied_field<<<blocks, threads>>>(d_bx, d_by, d_bz, src_nz, ny, nx, dst_nz, d_src_lo,
+                                           d_src_hi, d_weight_hi, average_z, d_out);
+  check_cuda(cudaGetLastError(), "k_map_applied_field launch");
 }
 
 void map_device_magnetization_to_host_stack(const float* d_mx,

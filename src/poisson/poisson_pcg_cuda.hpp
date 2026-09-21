@@ -54,7 +54,7 @@ class PoissonPcgCuda {
 
   const PoissonWorld* world_ = nullptr;
   int n_ = 0;
-  double tolerance_ = 1e-5;
+  double tolerance_ = 1e-6;
   int max_iterations_ = 2000;
   int tolerance_batch_first_ = 1000;
   int tolerance_batch_next_ = 500;

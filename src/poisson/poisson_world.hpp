@@ -1,5 +1,7 @@
 #pragma once
 
+#include "poisson_conductivity.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -24,13 +26,22 @@ struct TransportConfig {
   bool amr_enabled = false;
   bool ahe_enabled = false;
   bool the_enabled = false;
+  // Ordinary Hall on every conducting cell (Pt and FM). Default on.
+  bool ohe_enabled = true;
   double amr_ratio = 0.0;
   double ahe_ratio = 0.0;
   // Dimensionless THE scale: Sigma_THE = (the_ratio * sigma) * [h]_x where h is
   // the cell-local 3D winding from m·(Δm×Δm) (no 1/4π, no /Δx). Default 0.
   double the_ratio = 0.0;
+  // SI Hall coefficients (m^3/C) at 300 K. Pt: Hurd/CRC / Greig-Livesey.
+  // FM (Fe3GaTe2): Zhang et al., Nat. Commun. 13, 5067 (2022), Supp. Table 5.
+  double hall_coefficient_pt = -2.44e-11;
+  double hall_coefficient_fm = 3.09e-10;
   int picard_sweeps = 2;
   double picard_tolerance = 0.0;
+  // If true, build Σ = ρ^{-1} per cell (AMR resistivity + one Hall vector) and
+  // split into S/K. Set once at solver construction; additive remains default.
+  bool resistivity_invert = false;
 };
 
 struct SymTensor6 {
@@ -98,12 +109,30 @@ class PoissonWorld {
 
   const TransportConfig& transport_config() const { return config_; }
   bool transport_enabled() const {
+    return config_.amr_enabled || config_.ahe_enabled || config_.the_enabled ||
+           config_.ohe_enabled;
+  }
+  bool magnetization_required() const {
     return config_.amr_enabled || config_.ahe_enabled || config_.the_enabled;
   }
   bool amr_enabled() const { return config_.amr_enabled; }
   bool ahe_enabled() const { return config_.ahe_enabled; }
   bool the_enabled() const { return config_.the_enabled; }
-  bool skew_enabled() const { return config_.ahe_enabled || config_.the_enabled; }
+  bool ohe_enabled() const { return config_.ohe_enabled; }
+  bool resistivity_invert() const { return config_.resistivity_invert; }
+  bool skew_enabled() const {
+    return config_.ahe_enabled || config_.the_enabled || config_.ohe_enabled;
+  }
+  double hall_coefficient_pt() const { return config_.hall_coefficient_pt; }
+  double hall_coefficient_fm() const { return config_.hall_coefficient_fm; }
+
+  float applied_bx() const { return applied_bx_; }
+  float applied_by() const { return applied_by_; }
+  float applied_bz() const { return applied_bz_; }
+  bool applied_field_uniform() const { return applied_field_uniform_; }
+  const std::vector<float>& applied_field_grid() const { return applied_field_; }
+  void set_applied_field_uniform(float bx, float by, float bz);
+  void set_applied_field_grid(const std::vector<float>& b_poisson);
 
   /// Cell-local winding on the FM stack, mumax layout (3, n_fm, ny, nx). Empty if THE is off.
   const std::vector<float>& winding_fm_stack() const { return winding_; }
@@ -125,7 +154,7 @@ class PoissonWorld {
     return is_fm(cell) && is_conducting(cell);
   }
   bool uses_scalar_transport(int cell) const {
-    return is_conducting(cell) && !uses_magnetization(cell);
+    return is_conducting(cell) && !uses_magnetization(cell) && !config_.ohe_enabled;
   }
 
   SymTensor6 sym_tensor(int cell) const;
@@ -135,7 +164,7 @@ class PoissonWorld {
   void set_magnetization_fm_stack(const std::vector<float>& magnetization_mumax);
   void refresh_transport_tensors();
   void rebuild_transport_operators();
-  /// Build maximal AMR/AHE/THE CSR sparsity from geometry only (no m dependence).
+  /// Build maximal AMR/AHE/THE/OHE CSR sparsity from geometry only (no m/B dependence).
   /// Values are placeholders; GMRES device update overwrites them each step.
   void build_transport_pattern_operators();
 
@@ -180,6 +209,8 @@ class PoissonWorld {
 
   SymTensor6 sym_tensor_for_cell(int cell) const;
   SkewTensor3 skew_tensor_for_cell(int cell) const;
+  PoissonConductivityInputs conductivity_inputs_for_cell(int cell) const;
+  void load_applied_b(int cell, float& bx, float& by, float& bz) const;
   void refresh_cell_tensors();
   void refresh_winding_fm_stack();
 
@@ -214,4 +245,10 @@ class PoissonWorld {
   // Cell-local THE winding h, same layout as magnetization_.
   std::vector<float> winding_;
   bool magnetization_set_ = false;
+  float applied_bx_ = 0.0f;
+  float applied_by_ = 0.0f;
+  float applied_bz_ = 0.0f;
+  bool applied_field_uniform_ = true;
+  // Non-uniform applied B on the full Poisson grid, mumax layout (3, nz, ny, nx).
+  std::vector<float> applied_field_;
 };

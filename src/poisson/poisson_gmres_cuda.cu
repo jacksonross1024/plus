@@ -4,6 +4,7 @@
 #include <cfloat>
 #include <cmath>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -12,6 +13,8 @@
 #include <cuda_runtime.h>
 #include <cusparse.h>
 
+#include "poisson_gmg_cuda.hpp"
+#include "poisson_conductivity.hpp"
 #include "poisson_world.hpp"
 
 namespace {
@@ -53,22 +56,6 @@ __global__ void k_jacobi(double* z, const double* r, const double* inv_diag, int
     z[i] = r[i] * inv_diag[i];
   }
 }
-
-struct SymTensor6D {
-  float xx = 0.0f;
-  float yy = 0.0f;
-  float zz = 0.0f;
-  float xy = 0.0f;
-  float xz = 0.0f;
-  float yz = 0.0f;
-};
-
-struct SkewTensor3D {
-  float xy = 0.0f;
-  float xz = 0.0f;
-  float yz = 0.0f;
-};
-
 __device__ bool d_in_bounds(int value, int limit) {
   return value >= 0 && value < limit;
 }
@@ -134,44 +121,6 @@ __device__ void d_load_magnetization_fm_stack(float& mx,
 
 // region==2 cells are validated at prepare_transport_update to lie in FM layers;
 // no per-cell fm_layer range check on the hot path.
-__device__ SymTensor6D d_sym_tensor_for_cell(int cell,
-                                            const signed char* region,
-                                            const float* sigma,
-                                            int nx,
-                                            int ny,
-                                            int first_r2_layer,
-                                            int n_fm,
-                                            bool amr_enabled,
-                                            double amr_ratio,
-                                            const float* magnetization) {
-  const float s = sigma[cell];
-  if (!(s > 1e-20f)) {
-    return {};
-  }
-  if (!amr_enabled || region[cell] != 2) {
-    return {s, s, s, 0.0f, 0.0f, 0.0f};
-  }
-
-  const int plane = nx * ny;
-  const int iz = cell / plane;
-  const int rem = cell - iz * plane;
-  const int iy = rem / nx;
-  const int ix = rem - iy * nx;
-  const int fm_layer = iz - first_r2_layer;
-
-  float mx = 0.0f;
-  float my = 0.0f;
-  float mz = 0.0f;
-  d_load_magnetization_fm_stack(mx, my, mz, fm_layer, iy * nx + ix, n_fm, plane, magnetization);
-  const double q = 6.0 * amr_ratio / (6.0 + amr_ratio);
-  const double base_s = static_cast<double>(s);
-  return {static_cast<float>(base_s * (1.0 - q * (static_cast<double>(mx) * mx - 1.0 / 3.0))),
-          static_cast<float>(base_s * (1.0 - q * (static_cast<double>(my) * my - 1.0 / 3.0))),
-          static_cast<float>(base_s * (1.0 - q * (static_cast<double>(mz) * mz - 1.0 / 3.0))),
-          static_cast<float>(-base_s * q * static_cast<double>(mx) * my),
-          static_cast<float>(-base_s * q * static_cast<double>(mx) * mz),
-          static_cast<float>(-base_s * q * static_cast<double>(my) * mz)};
-}
 
 struct Vec3fD {
   float x = 0.0f;
@@ -300,52 +249,84 @@ __global__ void k_winding(int n_fm,
   winding[2u * n_xy + static_cast<std::size_t>(idx)] = hz;
 }
 
-__device__ SkewTensor3D d_skew_tensor_for_cell(int cell,
-                                              const signed char* region,
-                                              const float* sigma,
-                                              int nx,
-                                              int ny,
-                                              int first_r2_layer,
-                                              int n_fm,
-                                              bool ahe_enabled,
-                                              double ahe_ratio,
-                                              bool the_enabled,
-                                              double the_ratio,
-                                              const float* magnetization,
-                                              const float* winding) {
-  if ((!ahe_enabled && !the_enabled) || !d_uses_magnetization(region, sigma, cell)) {
+__device__ void d_load_applied_b(int cell,
+                                 int cell_count,
+                                 bool uniform,
+                                 float ubx,
+                                 float uby,
+                                 float ubz,
+                                 const float* b_ext,
+                                 float& bx,
+                                 float& by,
+                                 float& bz) {
+  if (uniform || b_ext == nullptr) {
+    bx = ubx;
+    by = uby;
+    bz = ubz;
+    return;
+  }
+  bx = b_ext[cell];
+  by = b_ext[cell_count + cell];
+  bz = b_ext[2 * cell_count + cell];
+}
+
+__device__ PoissonConductivitySplit d_conductivity_for_cell(
+    int cell,
+    const signed char* region,
+    const float* sigma,
+    int nx,
+    int ny,
+    int first_r2_layer,
+    int n_fm,
+    int cell_count,
+    bool amr_enabled,
+    double amr_ratio,
+    bool ahe_enabled,
+    double ahe_ratio,
+    bool the_enabled,
+    double the_ratio,
+    bool ohe_enabled,
+    double hall_r_pt,
+    double hall_r_fm,
+    bool resistivity_invert,
+    bool b_uniform,
+    float ubx,
+    float uby,
+    float ubz,
+    const float* b_ext,
+    const float* magnetization,
+    const float* winding) {
+  PoissonConductivityInputs in;
+  in.sigma0 = sigma[cell];
+  if (!(in.sigma0 > 1e-20f)) {
     return {};
   }
-  const int plane = nx * ny;
-  const int iz = cell / plane;
-  const int rem = cell - iz * plane;
-  const int iy = rem / nx;
-  const int ix = rem - iy * nx;
-  const int fm_layer = iz - first_r2_layer;
-  SkewTensor3D k{};
-  if (ahe_enabled) {
-    float mx = 0.0f;
-    float my = 0.0f;
-    float mz = 0.0f;
-    d_load_magnetization_fm_stack(mx, my, mz, fm_layer, iy * nx + ix, n_fm, plane, magnetization);
-    if (!(mx == 0.0f && my == 0.0f && mz == 0.0f)) {
-      const float sigma_ahe = static_cast<float>(ahe_ratio * static_cast<double>(sigma[cell]));
-      k.xy += -sigma_ahe * mz;
-      k.xz += sigma_ahe * my;
-      k.yz += -sigma_ahe * mx;
+  in.is_fm = region[cell] == 2;
+  in.is_pt = region[cell] == 1;
+  in.amr_enabled = amr_enabled;
+  in.ahe_enabled = ahe_enabled;
+  in.the_enabled = the_enabled;
+  in.ohe_enabled = ohe_enabled;
+  in.resistivity_invert = resistivity_invert;
+  in.amr_ratio = amr_ratio;
+  in.ahe_ratio = ahe_ratio;
+  in.the_ratio = the_ratio;
+  in.hall_coefficient = in.is_pt ? hall_r_pt : hall_r_fm;
+  d_load_applied_b(cell, cell_count, b_uniform, ubx, uby, ubz, b_ext, in.bx, in.by, in.bz);
+  if (in.is_fm && magnetization != nullptr) {
+    const int plane = nx * ny;
+    const int iz = cell / plane;
+    const int rem = cell - iz * plane;
+    const int iy = rem / nx;
+    const int ix = rem - iy * nx;
+    const int fm_layer = iz - first_r2_layer;
+    d_load_magnetization_fm_stack(in.mx, in.my, in.mz, fm_layer, iy * nx + ix, n_fm, plane,
+                                  magnetization);
+    if (the_enabled && winding != nullptr) {
+      d_load_vector_fm_stack(in.hx, in.hy, in.hz, fm_layer, iy * nx + ix, n_fm, plane, winding);
     }
   }
-  if (the_enabled && winding != nullptr) {
-    float hx = 0.0f;
-    float hy = 0.0f;
-    float hz = 0.0f;
-    d_load_vector_fm_stack(hx, hy, hz, fm_layer, iy * nx + ix, n_fm, plane, winding);
-    const float sigma_the = static_cast<float>(the_ratio * static_cast<double>(sigma[cell]));
-    k.xy += -sigma_the * hz;
-    k.xz += sigma_the * hy;
-    k.yz += -sigma_the * hx;
-  }
-  return k;
+  return poisson_conductivity_from_inputs(in);
 }
 
 __device__ float d_avg_diag(float a, float b) {
@@ -606,6 +587,7 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
                                                   int nz,
                                                   int first_r2_layer,
                                                   int n_fm,
+                                                  int cell_count,
                                                   double cx,
                                                   double cy,
                                                   double cz,
@@ -615,6 +597,15 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
                                                   double ahe_ratio,
                                                   bool the_enabled,
                                                   double the_ratio,
+                                                  bool ohe_enabled,
+                                                  bool resistivity_invert,
+                                                  double hall_r_pt,
+                                                  double hall_r_fm,
+                                                  bool b_uniform,
+                                                  float ubx,
+                                                  float uby,
+                                                  float ubz,
+                                                  const float* b_ext,
                                                   const float* magnetization,
                                                   const float* winding,
                                                   const signed char* region,
@@ -644,11 +635,12 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
   const int rem = cell - iz * plane;
   const int iy = rem / nx;
   const int ix = rem - iy * nx;
-  const SymTensor6D s0 = d_sym_tensor_for_cell(cell, region, sigma, nx, ny, first_r2_layer, n_fm,
-                                               amr_enabled, amr_ratio, magnetization);
-  const SkewTensor3D k0 = d_skew_tensor_for_cell(cell, region, sigma, nx, ny, first_r2_layer, n_fm,
-                                                 ahe_enabled, ahe_ratio, the_enabled, the_ratio,
-                                                 magnetization, winding);
+  const bool hall_enabled = ahe_enabled || the_enabled || ohe_enabled;
+  const bool even_cross = amr_enabled || resistivity_invert;
+  const PoissonConductivitySplit t0 = d_conductivity_for_cell(
+      cell, region, sigma, nx, ny, first_r2_layer, n_fm, cell_count, amr_enabled, amr_ratio,
+      ahe_enabled, ahe_ratio, the_enabled, the_ratio, ohe_enabled, hall_r_pt, hall_r_fm,
+      resistivity_invert, b_uniform, ubx, uby, ubz, b_ext, magnetization, winding);
 
   double rhs = 0.0;
   double diag = 0.0;
@@ -667,19 +659,18 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
     if (!d_is_conducting(sigma, nbr)) {
       continue;
     }
-    const SymTensor6D s1 = d_sym_tensor_for_cell(nbr, region, sigma, nx, ny, first_r2_layer, n_fm,
-                                                 amr_enabled, amr_ratio, magnetization);
-    const SkewTensor3D k1 = d_skew_tensor_for_cell(nbr, region, sigma, nx, ny, first_r2_layer, n_fm,
-                                                   ahe_enabled, ahe_ratio, the_enabled, the_ratio,
-                                                   magnetization, winding);
 
+    const PoissonConductivitySplit t1 = d_conductivity_for_cell(
+        nbr, region, sigma, nx, ny, first_r2_layer, n_fm, cell_count, amr_enabled, amr_ratio,
+        ahe_enabled, ahe_ratio, the_enabled, the_ratio, ohe_enabled, hall_r_pt, hall_r_fm,
+        resistivity_invert, b_uniform, ubx, uby, ubz, b_ext, magnetization, winding);
     float face_diag = 0.0f;
     if (axis == 0) {
-      face_diag = d_avg_diag(s0.xx, s1.xx);
+      face_diag = d_avg_diag(t0.S.xx, t1.S.xx);
     } else if (axis == 1) {
-      face_diag = d_avg_diag(s0.yy, s1.yy);
+      face_diag = d_avg_diag(t0.S.yy, t1.S.yy);
     } else {
-      face_diag = d_avg_diag(s0.zz, s1.zz);
+      face_diag = d_avg_diag(t0.S.zz, t1.S.zz);
     }
     if (face_diag > 0.0f) {
       const double g = d_face_area(axis, cx, cy, cz) * static_cast<double>(face_diag) /
@@ -690,19 +681,17 @@ __global__ void k_update_transport_matrix_and_rhs(int n,
                          col_idx, val, rhs, diag, fail, false);
     }
 
-    const float sym_xy = d_avg_signed(s0.xy, s1.xy);
-    const float sym_xz = d_avg_signed(s0.xz, s1.xz);
-    const float sym_yz = d_avg_signed(s0.yz, s1.yz);
-    d_add_cross_terms(row, cell, nbr, axis, sym_xy, sym_xz, sym_yz, nx, ny, nz, cx, cy, cz,
-                      sigma, unknown_index, contact_id, potentials, row_off, col_idx, val, rhs,
-                      diag, fail, false);
-    if (ahe_enabled || the_enabled) {
-      const float skew_xy = d_avg_signed(k0.xy, k1.xy);
-      const float skew_xz = d_avg_signed(k0.xz, k1.xz);
-      const float skew_yz = d_avg_signed(k0.yz, k1.yz);
-      d_add_cross_terms(row, cell, nbr, axis, skew_xy, skew_xz, skew_yz, nx, ny, nz, cx, cy, cz,
-                        sigma, unknown_index, contact_id, potentials, row_off, col_idx, val, rhs,
-                        diag, fail, true);
+    if (even_cross) {
+      d_add_cross_terms(row, cell, nbr, axis, d_avg_signed(t0.S.xy, t1.S.xy),
+                        d_avg_signed(t0.S.xz, t1.S.xz), d_avg_signed(t0.S.yz, t1.S.yz), nx, ny, nz,
+                        cx, cy, cz, sigma, unknown_index, contact_id, potentials, row_off, col_idx,
+                        val, rhs, diag, fail, false);
+    }
+    if (hall_enabled) {
+      d_add_cross_terms(row, cell, nbr, axis, d_avg_signed(t0.K.xy, t1.K.xy),
+                        d_avg_signed(t0.K.xz, t1.K.xz), d_avg_signed(t0.K.yz, t1.K.yz), nx, ny, nz,
+                        cx, cy, cz, sigma, unknown_index, contact_id, potentials, row_off, col_idx,
+                        val, rhs, diag, fail, true);
     }
   }
   diag_out[row] = diag;
@@ -827,6 +816,7 @@ void PoissonGmresCuda::destroy_spmv_descriptors() const {
 }
 
 PoissonGmresCuda::~PoissonGmresCuda() {
+  gmg_.reset();
   if (spmat_) {
     cusparseDestroySpMat(static_cast<cusparseSpMatDescr_t>(spmat_));
   }
@@ -843,6 +833,7 @@ PoissonGmresCuda::~PoissonGmresCuda() {
   cudaFree(d_sigma_);
   cudaFree(d_magnetization_);
   cudaFree(d_h_);
+  cudaFree(d_b_ext_);
   cudaFree(d_contact_potentials_);
   cudaFree(d_update_fail_);
   cudaFree(d_x_);
@@ -852,6 +843,8 @@ PoissonGmresCuda::~PoissonGmresCuda() {
   cudaFree(d_w_);
   cudaFree(d_aw_);
   cudaFree(d_basis_);
+  cudaFree(d_zbasis_);
+  cudaFree(d_reduce_);
   if (handle_cusparse_) {
     cusparseDestroy(static_cast<cusparseHandle_t>(handle_cusparse_));
   }
@@ -868,8 +861,80 @@ void PoissonGmresCuda::set_restart(int restart) {
     return;
   }
   restart_ = restart;
+  if (restart_schedule_.empty()) {
+    restart_schedule_ = {restart};
+  } else {
+    restart_schedule_.front() = restart;
+  }
   cudaFree(d_basis_);
+  cudaFree(d_zbasis_);
   d_basis_ = nullptr;
+  d_zbasis_ = nullptr;
+}
+
+void PoissonGmresCuda::set_restart_schedule(const std::vector<int>& restarts) {
+  if (restarts.empty()) {
+    throw std::invalid_argument("gmres_restart cannot be empty");
+  }
+  for (int v : restarts) {
+    if (v < 0 || v == 1) {
+      throw std::invalid_argument("GMRES restart entries must be 0 or >= 2");
+    }
+  }
+  if (restarts.front() < 2) {
+    throw std::invalid_argument("finest GMRES restart must be >= 2");
+  }
+  restart_schedule_ = restarts;
+  set_restart(restarts.front());
+  if (gmg_) {
+    gmg_->set_restart_schedule(restart_schedule_);
+  }
+}
+
+void PoissonGmresCuda::set_preconditioner(PoissonPreconditionerKind kind) {
+  preconditioner_ = kind;
+  if (kind != PoissonPreconditionerKind::kGmg) {
+    cudaFree(d_zbasis_);
+    d_zbasis_ = nullptr;
+  }
+}
+
+void PoissonGmresCuda::set_applied_field_uniform(float bx, float by, float bz) {
+  applied_bx_ = bx;
+  applied_by_ = by;
+  applied_bz_ = bz;
+  applied_field_uniform_ = true;
+}
+
+void PoissonGmresCuda::set_applied_field_grid(const float* h_b_ext, std::size_t n_values) {
+  if (cell_count_ <= 0) {
+    throw std::runtime_error("GMRES applied-field grid requires a prepared transport pattern");
+  }
+  const std::size_t expected = 3u * static_cast<std::size_t>(cell_count_);
+  if (h_b_ext == nullptr || n_values != expected) {
+    throw std::runtime_error("GMRES applied-field grid size mismatch; expected (3, nz, ny, nx)");
+  }
+  if (!d_b_ext_) {
+    check_cuda(cudaMalloc(&d_b_ext_, expected * sizeof(float)), "cudaMalloc gmres B_ext");
+  }
+  check_cuda(cudaMemcpy(d_b_ext_, h_b_ext, expected * sizeof(float), cudaMemcpyHostToDevice),
+             "cudaMemcpy gmres B_ext");
+  applied_field_uniform_ = false;
+  applied_bx_ = 0.0f;
+  applied_by_ = 0.0f;
+  applied_bz_ = 0.0f;
+}
+
+void PoissonGmresCuda::scale_solution(double alpha) {
+  if (n_ <= 0 || !std::isfinite(alpha) || alpha == 1.0) {
+    return;
+  }
+  ensure_vectors();
+  if (!d_x_) {
+    return;
+  }
+  cublasHandle_t h = static_cast<cublasHandle_t>(handle_cublas_);
+  check_cublas(cublasDscal(h, n_, &alpha, d_x_, 1), "cublasDscal gmres voltage scale");
 }
 
 void PoissonGmresCuda::reset_solution() {
@@ -1021,10 +1086,18 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
   amr_enabled_ = world.amr_enabled();
   ahe_enabled_ = world.ahe_enabled();
   the_enabled_ = world.the_enabled();
+  ohe_enabled_ = world.ohe_enabled();
   const TransportConfig& config = world.transport_config();
+  resistivity_invert_ = config.resistivity_invert;
   amr_ratio_ = config.amr_ratio;
   ahe_ratio_ = config.ahe_ratio;
   the_ratio_ = config.the_ratio;
+  hall_coefficient_pt_ = config.hall_coefficient_pt;
+  hall_coefficient_fm_ = config.hall_coefficient_fm;
+  applied_field_uniform_ = world.applied_field_uniform();
+  applied_bx_ = world.applied_bx();
+  applied_by_ = world.applied_by();
+  applied_bz_ = world.applied_bz();
 
   // One-time geometry check: region==2 cells must map into the FM magnetization stack.
   const int plane = nx_ * ny_;
@@ -1049,6 +1122,7 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
   cudaFree(d_sigma_);
   cudaFree(d_magnetization_);
   cudaFree(d_h_);
+  cudaFree(d_b_ext_);
   cudaFree(d_contact_potentials_);
   cudaFree(d_update_fail_);
   d_unknown_index_ = nullptr;
@@ -1058,6 +1132,7 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
   d_sigma_ = nullptr;
   d_magnetization_ = nullptr;
   d_h_ = nullptr;
+  d_b_ext_ = nullptr;
   d_contact_potentials_ = nullptr;
   d_update_fail_ = nullptr;
 
@@ -1076,8 +1151,17 @@ void PoissonGmresCuda::prepare_transport_update(const PoissonWorld& world) {
              "cudaMalloc gmres sigma");
   check_cuda(cudaMalloc(&d_magnetization_, mag_values * sizeof(float)),
              "cudaMalloc gmres magnetization");
+  check_cuda(cudaMemset(d_magnetization_, 0, mag_values * sizeof(float)),
+             "cudaMemset gmres magnetization");
   if (the_enabled_) {
     check_cuda(cudaMalloc(&d_h_, mag_values * sizeof(float)), "cudaMalloc gmres winding");
+  }
+  if (!applied_field_uniform_ && !world.applied_field_grid().empty()) {
+    const std::size_t n_b = world.applied_field_grid().size();
+    check_cuda(cudaMalloc(&d_b_ext_, n_b * sizeof(float)), "cudaMalloc gmres B_ext");
+    check_cuda(cudaMemcpy(d_b_ext_, world.applied_field_grid().data(), n_b * sizeof(float),
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy gmres B_ext");
   }
   check_cuda(
       cudaMalloc(&d_contact_potentials_, static_cast<std::size_t>(num_contacts_) * sizeof(double)),
@@ -1119,8 +1203,18 @@ void PoissonGmresCuda::update_transport_operator_and_rhs_device(
                         cudaMemcpyHostToDevice),
              "cudaMemcpy gmres contact potentials");
   check_cuda(cudaMemset(d_update_fail_, 0, sizeof(int)), "cudaMemset gmres update fail");
+  launch_transport_update(amr_enabled_, ahe_enabled_, the_enabled_, ohe_enabled_);
+  int failed = 0;
+  check_cuda(cudaMemcpy(&failed, d_update_fail_, sizeof(int), cudaMemcpyDeviceToHost),
+             "cudaMemcpy gmres update fail");
+  if (failed != 0) {
+    throw std::runtime_error(
+        "GMRES transport update encountered an entry outside the fixed CSR pattern");
+  }
+}
 
-  if (the_enabled_) {
+void PoissonGmresCuda::launch_transport_update(bool amr, bool ahe, bool the, bool ohe) const {
+  if (the) {
     if (d_h_ == nullptr || d_magnetization_ == nullptr) {
       throw std::runtime_error("GMRES THE winding buffer is not prepared");
     }
@@ -1134,18 +1228,42 @@ void PoissonGmresCuda::update_transport_operator_and_rhs_device(
 
   const int blocks = (n_ + threads_per_block() - 1) / threads_per_block();
   k_update_transport_matrix_and_rhs<<<blocks, threads_per_block()>>>(
-      n_, nx_, ny_, nz_, first_r2_layer_, fm_layer_count_, cx_, cy_, cz_, amr_enabled_,
-      amr_ratio_, ahe_enabled_, ahe_ratio_, the_enabled_, the_ratio_, d_magnetization_, d_h_,
-      d_region_, d_contact_id_, d_sigma_, d_unknown_index_, d_unknown_to_cell_, d_row_off_,
-      d_col_idx_, d_contact_potentials_, d_val_, d_diag_, d_inv_diag_, d_rhs_, d_update_fail_);
+      n_, nx_, ny_, nz_, first_r2_layer_, fm_layer_count_, cell_count_, cx_, cy_, cz_, amr,
+      amr_ratio_, ahe, ahe_ratio_, the, the_ratio_, ohe, resistivity_invert_, hall_coefficient_pt_,
+      hall_coefficient_fm_, applied_field_uniform_, applied_bx_, applied_by_, applied_bz_, d_b_ext_,
+      d_magnetization_, d_h_, d_region_, d_contact_id_, d_sigma_, d_unknown_index_,
+      d_unknown_to_cell_, d_row_off_, d_col_idx_, d_contact_potentials_, d_val_, d_diag_,
+      d_inv_diag_, d_rhs_, d_update_fail_);
   check_cuda(cudaGetLastError(), "k_update_transport_matrix_and_rhs launch");
-  int failed = 0;
-  check_cuda(cudaMemcpy(&failed, d_update_fail_, sizeof(int), cudaMemcpyDeviceToHost),
-             "cudaMemcpy gmres update fail");
-  if (failed != 0) {
-    throw std::runtime_error(
-        "GMRES transport update encountered an entry outside the fixed CSR pattern");
+}
+
+void PoissonGmresCuda::build_gmg(const PoissonWorld& world) {
+  gmg_ = std::make_unique<PoissonGmgCuda>();
+  gmg_->build(world);
+  gmg_->set_restart_schedule(restart_schedule_);
+  ensure_vectors();
+}
+
+bool PoissonGmresCuda::gmg_ready() const { return gmg_ && gmg_->ready(); }
+
+int PoissonGmresCuda::gmg_n_levels() const { return gmg_ ? gmg_->n_levels() : 0; }
+
+std::vector<int> PoissonGmresCuda::gmg_unknown_counts() const {
+  if (!gmg_) {
+    return {};
   }
+  return gmg_->unknown_counts();
+}
+
+bool PoissonGmresCuda::gmg_void_sparsity_ok() const {
+  return gmg_ && gmg_->void_sparsity_ok();
+}
+
+std::vector<int> PoissonGmresCuda::restart_schedule() const {
+  if (gmg_) {
+    return gmg_->restart_schedule();
+  }
+  return restart_schedule_;
 }
 
 void PoissonGmresCuda::update_transport_operator_and_rhs_device(
@@ -1187,6 +1305,15 @@ void PoissonGmresCuda::ensure_vectors() const {
                           static_cast<std::size_t>(restart_ + 1) * static_cast<std::size_t>(n_) *
                               sizeof(double)),
                "cudaMalloc gmres basis");
+  }
+  if (preconditioner_ == PoissonPreconditionerKind::kGmg && !d_zbasis_) {
+    check_cuda(cudaMalloc(&d_zbasis_,
+                          static_cast<std::size_t>(restart_) * static_cast<std::size_t>(n_) *
+                              sizeof(double)),
+               "cudaMalloc gmres zbasis");
+  }
+  if (!d_reduce_) {
+    check_cuda(cudaMalloc(&d_reduce_, sizeof(double)), "cudaMalloc gmres reduce");
   }
 }
 
@@ -1248,7 +1375,47 @@ double* PoissonGmresCuda::basis_vector(int index) const {
   return d_basis_ + static_cast<std::size_t>(index) * static_cast<std::size_t>(n_);
 }
 
+double* PoissonGmresCuda::zbasis_vector(int index) const {
+  return d_zbasis_ + static_cast<std::size_t>(index) * static_cast<std::size_t>(n_);
+}
+
+double PoissonGmresCuda::nrm2_d2h(const double* d_x) const {
+  cublasHandle_t h = static_cast<cublasHandle_t>(handle_cublas_);
+  check_cublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE),
+               "cublasSetPointerMode DEVICE nrm2");
+  check_cublas(cublasDnrm2(h, n_, d_x, 1, d_reduce_), "cublasDnrm2 device");
+  check_cublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST),
+               "cublasSetPointerMode HOST nrm2");
+  double value = 0.0;
+  check_cuda(cudaMemcpy(&value, d_reduce_, sizeof(double), cudaMemcpyDeviceToHost),
+             "cudaMemcpy gmres nrm2");
+  return value;
+}
+
+double PoissonGmresCuda::dot_d2h(const double* d_x, const double* d_y) const {
+  cublasHandle_t h = static_cast<cublasHandle_t>(handle_cublas_);
+  check_cublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE),
+               "cublasSetPointerMode DEVICE dot");
+  check_cublas(cublasDdot(h, n_, d_x, 1, d_y, 1, d_reduce_), "cublasDdot device");
+  check_cublas(cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST),
+               "cublasSetPointerMode HOST dot");
+  double value = 0.0;
+  check_cuda(cudaMemcpy(&value, d_reduce_, sizeof(double), cudaMemcpyDeviceToHost),
+             "cudaMemcpy gmres dot");
+  return value;
+}
+
 PcgResult PoissonGmresCuda::solve_device_rhs(std::vector<double>& x) const {
+  if (preconditioner_ == PoissonPreconditionerKind::kGmg) {
+    if (!gmg_ready()) {
+      throw std::runtime_error("GMRES gmg preconditioner is not built");
+    }
+    return solve_device_rhs_fgmres(x);
+  }
+  return solve_device_rhs_jacobi(x);
+}
+
+PcgResult PoissonGmresCuda::solve_device_rhs_jacobi(std::vector<double>& x) const {
   PcgResult result;
   if (n_ == 0) {
     result.converged = true;
@@ -1264,7 +1431,6 @@ PcgResult PoissonGmresCuda::solve_device_rhs(std::vector<double>& x) const {
   cublasHandle_t h = static_cast<cublasHandle_t>(handle_cublas_);
   const int blocks = (n_ + threads_per_block() - 1) / threads_per_block();
 
-  // Default-stream cuBLAS host-mode reductions order kernels; no explicit sync needed.
   spmv(d_x_, d_aw_);
   k_residual<<<blocks, threads_per_block()>>>(d_r_, d_rhs_, d_aw_, n_);
 
@@ -1286,8 +1452,7 @@ PcgResult PoissonGmresCuda::solve_device_rhs(std::vector<double>& x) const {
   int total_iters = 0;
   while (total_iters < max_iterations_) {
     k_jacobi<<<blocks, threads_per_block()>>>(d_z_, d_r_, d_inv_diag_, n_);
-    double beta = 0.0;
-    check_cublas(cublasDnrm2(h, n_, d_z_, 1, &beta), "cublasDnrm2 gmres beta");
+    const double beta = nrm2_d2h(d_z_);
     if (!(beta > 0.0) || !std::isfinite(beta)) {
       result.numerical_failure = true;
       break;
@@ -1305,17 +1470,14 @@ PcgResult PoissonGmresCuda::solve_device_rhs(std::vector<double>& x) const {
       k_jacobi<<<blocks, threads_per_block()>>>(d_w_, d_aw_, d_inv_diag_, n_);
 
       for (int i = 0; i <= j; ++i) {
-        double hij = 0.0;
-        check_cublas(cublasDdot(h, n_, d_w_, 1, basis_vector(i), 1, &hij),
-                     "cublasDdot gmres h");
+        const double hij = dot_d2h(d_w_, basis_vector(i));
         hessenberg[static_cast<std::size_t>(i + rows_h * j)] = hij;
         const double neg_hij = -hij;
         check_cublas(cublasDaxpy(h, n_, &neg_hij, basis_vector(i), 1, d_w_, 1),
                      "cublasDaxpy gmres orthogonalize");
       }
 
-      double hnext = 0.0;
-      check_cublas(cublasDnrm2(h, n_, d_w_, 1, &hnext), "cublasDnrm2 gmres hnext");
+      const double hnext = nrm2_d2h(d_w_);
       hessenberg[static_cast<std::size_t>((j + 1) + rows_h * j)] = hnext;
       if (hnext > DBL_MIN) {
         check_cublas(cublasDcopy(h, n_, d_w_, 1, basis_vector(j + 1), 1),
@@ -1339,6 +1501,109 @@ PcgResult PoissonGmresCuda::solve_device_rhs(std::vector<double>& x) const {
       const double yi = y[static_cast<std::size_t>(i)];
       check_cublas(cublasDaxpy(h, n_, &yi, basis_vector(i), 1, d_x_, 1),
                    "cublasDaxpy gmres update x");
+    }
+
+    spmv(d_x_, d_aw_);
+    k_residual<<<blocks, threads_per_block()>>>(d_r_, d_rhs_, d_aw_, n_);
+    result.residual_max_norm = device_max_abs(h, n_, d_r_);
+    result.residual_relative =
+        (rhs_linf > 0.0) ? (result.residual_max_norm / rhs_linf) : 0.0;
+    if (residual_meets_tolerance(result.residual_max_norm, rhs_linf, tolerance_)) {
+      result.converged = true;
+      break;
+    }
+  }
+
+  result.converged = residual_meets_tolerance(result.residual_max_norm, rhs_linf, tolerance_);
+  if (!result.converged && result.iterations >= max_iterations_) {
+    result.numerical_failure = false;
+  }
+  copy_solution_to_host(x);
+  return result;
+}
+
+PcgResult PoissonGmresCuda::solve_device_rhs_fgmres(std::vector<double>& x) const {
+  PcgResult result;
+  if (n_ == 0) {
+    result.converged = true;
+    return result;
+  }
+  ensure_vectors();
+  if (x.size() != static_cast<std::size_t>(n_)) {
+    x.assign(static_cast<std::size_t>(n_), 0.0);
+    check_cuda(cudaMemset(d_x_, 0, static_cast<std::size_t>(n_) * sizeof(double)),
+               "cudaMemset gmres x");
+  }
+
+  cublasHandle_t h = static_cast<cublasHandle_t>(handle_cublas_);
+  const int blocks = (n_ + threads_per_block() - 1) / threads_per_block();
+
+  spmv(d_x_, d_aw_);
+  k_residual<<<blocks, threads_per_block()>>>(d_r_, d_rhs_, d_aw_, n_);
+
+  const double rhs_linf = device_max_abs(h, n_, d_rhs_);
+  const double r0_linf = device_max_abs(h, n_, d_r_);
+  result.rhs_inf_norm = rhs_linf;
+  result.initial_residual_max_norm = r0_linf;
+  result.residual_max_norm = r0_linf;
+  result.residual_relative = (rhs_linf > 0.0) ? (r0_linf / rhs_linf) : 0.0;
+  if (residual_meets_tolerance(result.residual_max_norm, rhs_linf, tolerance_)) {
+    result.converged = true;
+    copy_solution_to_host(x);
+    return result;
+  }
+
+  const int rows_h = restart_ + 1;
+  std::vector<double> hessenberg(static_cast<std::size_t>(rows_h * restart_), 0.0);
+
+  int total_iters = 0;
+  while (total_iters < max_iterations_) {
+    const double beta = nrm2_d2h(d_r_);
+    if (!(beta > 0.0) || !std::isfinite(beta)) {
+      result.numerical_failure = true;
+      break;
+    }
+    check_cublas(cublasDcopy(h, n_, d_r_, 1, basis_vector(0), 1), "cublasDcopy fgmres v0");
+    const double inv_beta = 1.0 / beta;
+    check_cublas(cublasDscal(h, n_, &inv_beta, basis_vector(0), 1), "cublasDscal fgmres v0");
+    std::fill(hessenberg.begin(), hessenberg.end(), 0.0);
+
+    int inner_used = 0;
+    for (int j = 0; j < restart_ && total_iters < max_iterations_; ++j) {
+      gmg_->apply(basis_vector(j), zbasis_vector(j));
+      spmv(zbasis_vector(j), d_w_);
+
+      for (int i = 0; i <= j; ++i) {
+        const double hij = dot_d2h(d_w_, basis_vector(i));
+        hessenberg[static_cast<std::size_t>(i + rows_h * j)] = hij;
+        const double neg_hij = -hij;
+        check_cublas(cublasDaxpy(h, n_, &neg_hij, basis_vector(i), 1, d_w_, 1),
+                     "cublasDaxpy fgmres orthogonalize");
+      }
+
+      const double hnext = nrm2_d2h(d_w_);
+      hessenberg[static_cast<std::size_t>((j + 1) + rows_h * j)] = hnext;
+      if (hnext > DBL_MIN) {
+        check_cublas(cublasDcopy(h, n_, d_w_, 1, basis_vector(j + 1), 1),
+                     "cublasDcopy fgmres vnext");
+        const double inv_hnext = 1.0 / hnext;
+        check_cublas(cublasDscal(h, n_, &inv_hnext, basis_vector(j + 1), 1),
+                     "cublasDscal fgmres vnext");
+      }
+
+      ++total_iters;
+      ++inner_used;
+      result.iterations = total_iters;
+      if (hnext <= DBL_MIN) {
+        break;
+      }
+    }
+
+    const std::vector<double> y = solve_least_squares(hessenberg, beta, rows_h, inner_used);
+    for (int i = 0; i < inner_used; ++i) {
+      const double yi = y[static_cast<std::size_t>(i)];
+      check_cublas(cublasDaxpy(h, n_, &yi, zbasis_vector(i), 1, d_x_, 1),
+                   "cublasDaxpy fgmres update x");
     }
 
     spmv(d_x_, d_aw_);

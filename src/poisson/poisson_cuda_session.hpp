@@ -29,7 +29,9 @@ class PoissonCudaSession {
                      int cuda_tol_batch_next,
                      TransportConfig transport = TransportConfig{},
                      PoissonLinearSolverKind solver_kind = PoissonLinearSolverKind::kPcg,
-                     int gmres_restart = 50);
+                     std::vector<int> gmres_restart = {200},
+                     bool voltage_scale_guess = false,
+                     PoissonPreconditionerKind preconditioner = PoissonPreconditionerKind::kJacobi);
 
   ~PoissonCudaSession();
 
@@ -73,11 +75,25 @@ class PoissonCudaSession {
   bool amr_enabled() const { return world_.amr_enabled(); }
   bool ahe_enabled() const { return world_.ahe_enabled(); }
   bool the_enabled() const { return world_.the_enabled(); }
+  bool ohe_enabled() const { return world_.ohe_enabled(); }
+  bool resistivity_invert() const { return transport_config_.resistivity_invert; }
+  bool magnetization_required() const { return world_.magnetization_required(); }
   double amr_ratio() const { return transport_config_.amr_ratio; }
   double ahe_ratio() const { return transport_config_.ahe_ratio; }
   double the_ratio() const { return transport_config_.the_ratio; }
+  double hall_coefficient_pt() const { return transport_config_.hall_coefficient_pt; }
+  double hall_coefficient_fm() const { return transport_config_.hall_coefficient_fm; }
   int picard_sweeps() const { return transport_config_.picard_sweeps; }
   PoissonLinearSolverKind solver_kind() const { return solver_kind_; }
+  PoissonPreconditionerKind preconditioner() const { return preconditioner_; }
+  bool voltage_scale_guess() const { return voltage_scale_guess_; }
+  int gmg_n_levels() const { return gmres_solver_.gmg_n_levels(); }
+  std::vector<int> gmg_unknown_counts() const { return gmres_solver_.gmg_unknown_counts(); }
+  std::vector<int> gmres_restart_schedule() const { return gmres_solver_.restart_schedule(); }
+  bool gmg_void_sparsity_ok() const { return gmres_solver_.gmg_void_sparsity_ok(); }
+
+  void set_applied_field_uniform(float bx, float by, float bz);
+  void set_applied_field_grid(const std::vector<float>& b_poisson);
 
   int out_nx() const { return output_spec_.out_nx(); }
   int out_ny() const { return output_spec_.out_ny(); }
@@ -100,6 +116,8 @@ class PoissonCudaSession {
   static void validate_contact_potentials(const PoissonWorld& world,
                                           const ContactPotentials& potentials);
   static int initial_max_iterations(int max_iterations);
+  void maybe_scale_voltage_guess();
+  void remember_solved_contact_voltages();
   StepStats iterate_impl(const std::vector<float>* magnetization_fm_stack,
                          double timing_device_magnetization_s = 0.0);
   StepStats finish_iterate_after_solve(StepStats stats,
@@ -115,12 +133,17 @@ class PoissonCudaSession {
   PoissonGmresCuda gmres_solver_;
   TransportConfig transport_config_;
   PoissonLinearSolverKind solver_kind_ = PoissonLinearSolverKind::kPcg;
+  PoissonPreconditionerKind preconditioner_ = PoissonPreconditionerKind::kJacobi;
 
-  double tolerance_ = 1e-5;
+  double tolerance_ = 1e-6;
   int max_iterations_ = 2000;
   double skip_threshold_ = 1e-5;
   int step_ = 0;
   bool first_solve_ = true;
+  bool voltage_scale_guess_ = false;
+  bool last_voltage_scale_applied_ = false;
+  double last_voltage_scale_alpha_ = 1.0;
+  std::vector<double> last_solved_applied_;
 
   std::vector<double> x_;
   std::vector<double> applied_;

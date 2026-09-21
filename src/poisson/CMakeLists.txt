@@ -4,6 +4,7 @@ add_library(poisson_native STATIC
     signal_loader.cpp
     poisson_pcg_cuda.cu
     poisson_gmres_cuda.cu
+    poisson_gmg_cuda.cu
     poisson_magnetization_cuda.cu
     poisson_cuda_session.cpp
 )

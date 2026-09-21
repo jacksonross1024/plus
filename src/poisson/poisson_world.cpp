@@ -337,6 +337,49 @@ void PoissonWorld::validate_loaded_geometry() {
   num_contacts_ = max_channel;
 }
 
+void PoissonWorld::set_applied_field_uniform(float bx, float by, float bz) {
+  if (!std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
+    throw std::runtime_error("applied field components must be finite");
+  }
+  applied_bx_ = bx;
+  applied_by_ = by;
+  applied_bz_ = bz;
+  applied_field_uniform_ = true;
+  applied_field_.clear();
+}
+
+void PoissonWorld::set_applied_field_grid(const std::vector<float>& b_poisson) {
+  const std::size_t expected = 3u * static_cast<std::size_t>(cell_count());
+  if (b_poisson.size() != expected) {
+    throw std::runtime_error(
+        "applied-field grid size mismatch; expected (3, nz, ny, nx) flattened");
+  }
+  for (float v : b_poisson) {
+    if (!std::isfinite(v)) {
+      throw std::runtime_error("applied field contains a non-finite value");
+    }
+  }
+  applied_field_ = b_poisson;
+  applied_field_uniform_ = false;
+  applied_bx_ = 0.0f;
+  applied_by_ = 0.0f;
+  applied_bz_ = 0.0f;
+}
+
+void PoissonWorld::load_applied_b(int cell, float& bx, float& by, float& bz) const {
+  if (applied_field_uniform_ || applied_field_.empty()) {
+    bx = applied_bx_;
+    by = applied_by_;
+    bz = applied_bz_;
+    return;
+  }
+  const std::size_t n_cells = static_cast<std::size_t>(cell_count());
+  const std::size_t idx = static_cast<std::size_t>(cell);
+  bx = applied_field_[idx];
+  by = applied_field_[n_cells + idx];
+  bz = applied_field_[2u * n_cells + idx];
+}
+
 void PoissonWorld::set_transport_config(TransportConfig config) {
   if (config.amr_enabled && !(config.amr_ratio >= 0.0) ) {
     throw std::runtime_error("amr_ratio must be >= 0 when AMR is enabled");
@@ -347,8 +390,13 @@ void PoissonWorld::set_transport_config(TransportConfig config) {
   if (config.the_enabled && !std::isfinite(config.the_ratio)) {
     throw std::runtime_error("the_ratio must be finite when THE is enabled");
   }
-  if ((config.ahe_enabled || config.the_enabled) && config.picard_sweeps < 1) {
-    throw std::runtime_error("picard_sweeps must be >= 1 when AHE or THE is enabled");
+  if (config.ohe_enabled &&
+      (!std::isfinite(config.hall_coefficient_pt) || !std::isfinite(config.hall_coefficient_fm))) {
+    throw std::runtime_error("Hall coefficients must be finite when OHE is enabled");
+  }
+  if ((config.ahe_enabled || config.the_enabled || config.ohe_enabled) &&
+      config.picard_sweeps < 1) {
+    throw std::runtime_error("picard_sweeps must be >= 1 when AHE, THE, or OHE is enabled");
   }
   config_ = config;
   if (!transport_enabled()) {
@@ -392,7 +440,7 @@ void PoissonWorld::refresh_transport_tensors() {
     winding_.clear();
     return;
   }
-  if (!magnetization_set_) {
+  if (magnetization_required() && !magnetization_set_) {
     throw std::runtime_error("refresh_transport_tensors requires magnetization");
   }
   refresh_cell_tensors();
@@ -422,16 +470,30 @@ SkewTensor3 PoissonWorld::skew_tensor(int cell) const {
   return skew_tensor_for_cell(cell);
 }
 
-SymTensor6 PoissonWorld::sym_tensor_for_cell(int cell) const {
-  const float s = sigma_[static_cast<std::size_t>(cell)];
-  if (!is_conducting(cell)) {
-    return {};
+PoissonConductivityInputs PoissonWorld::conductivity_inputs_for_cell(int cell) const {
+  PoissonConductivityInputs in;
+  in.sigma0 = sigma_[static_cast<std::size_t>(cell)];
+  in.is_fm = is_fm(cell);
+  in.is_pt = is_pt(cell);
+  in.amr_enabled = config_.amr_enabled;
+  in.ahe_enabled = config_.ahe_enabled;
+  in.the_enabled = config_.the_enabled;
+  in.ohe_enabled = config_.ohe_enabled;
+  in.resistivity_invert = config_.resistivity_invert;
+  in.amr_ratio = config_.amr_ratio;
+  in.ahe_ratio = config_.ahe_ratio;
+  in.the_ratio = config_.the_ratio;
+  in.hall_coefficient = is_pt(cell) ? config_.hall_coefficient_pt : config_.hall_coefficient_fm;
+  load_applied_b(cell, in.bx, in.by, in.bz);
+
+  if (!uses_magnetization(cell)) {
+    return in;
   }
-  if (!config_.amr_enabled || !uses_magnetization(cell)) {
-    return {s, s, s, 0.0f, 0.0f, 0.0f};
+  if ((config_.amr_enabled || config_.ahe_enabled || config_.the_enabled) && !magnetization_set_) {
+    throw std::runtime_error("transport enabled but magnetization has not been set");
   }
   if (!magnetization_set_) {
-    throw std::runtime_error("AMR enabled but magnetization has not been set");
+    return in;
   }
 
   const int n_fm = fm_layer_count();
@@ -442,7 +504,7 @@ SymTensor6 PoissonWorld::sym_tensor_for_cell(int cell) const {
   const int ix = rem % meta_.nx;
   const int fm_layer = iz - meta_.first_r2_layer;
   if (fm_layer < 0 || fm_layer >= n_fm) {
-    return {s, s, s, 0.0f, 0.0f, 0.0f};
+    return in;
   }
 
   const std::size_t n_xy = static_cast<std::size_t>(n_fm) * static_cast<std::size_t>(plane);
@@ -461,77 +523,31 @@ SymTensor6 PoissonWorld::sym_tensor_for_cell(int cell) const {
   } else {
     mx = my = mz = 0.0f;
   }
+  in.mx = mx;
+  in.my = my;
+  in.mz = mz;
 
-  const double q = 6.0 * config_.amr_ratio / (6.0 + config_.amr_ratio);
-  const double base_s = static_cast<double>(s);
-  return {
-      static_cast<float>(base_s * (1.0 - q * (static_cast<double>(mx) * mx - 1.0 / 3.0))),
-      static_cast<float>(base_s * (1.0 - q * (static_cast<double>(my) * my - 1.0 / 3.0))),
-      static_cast<float>(base_s * (1.0 - q * (static_cast<double>(mz) * mz - 1.0 / 3.0))),
-      static_cast<float>(-base_s * q * static_cast<double>(mx) * my),
-      static_cast<float>(-base_s * q * static_cast<double>(mx) * mz),
-      static_cast<float>(-base_s * q * static_cast<double>(my) * mz),
-  };
-}
-
-SkewTensor3 PoissonWorld::skew_tensor_for_cell(int cell) const {
-  if (!skew_enabled() || !uses_magnetization(cell)) {
-    return {};
-  }
-  if (!magnetization_set_) {
-    throw std::runtime_error("AHE/THE enabled but magnetization has not been set");
-  }
-
-  const float s = sigma_[static_cast<std::size_t>(cell)];
-  const int n_fm = fm_layer_count();
-  const int plane = meta_.nx * meta_.ny;
-  const int iz = cell / plane;
-  const int rem = cell % plane;
-  const int iy = rem / meta_.nx;
-  const int ix = rem % meta_.nx;
-  const int fm_layer = iz - meta_.first_r2_layer;
-  if (fm_layer < 0 || fm_layer >= n_fm) {
-    return {};
-  }
-
-  const std::size_t n_xy = static_cast<std::size_t>(n_fm) * static_cast<std::size_t>(plane);
-  const std::size_t base =
-      static_cast<std::size_t>(fm_layer) * static_cast<std::size_t>(plane) +
-      static_cast<std::size_t>(iy) * static_cast<std::size_t>(meta_.nx) +
-      static_cast<std::size_t>(ix);
-
-  SkewTensor3 k{};
-  if (config_.ahe_enabled) {
-    float mx = magnetization_[base];
-    float my = magnetization_[n_xy + base];
-    float mz = magnetization_[2u * n_xy + base];
-    const float norm = std::sqrt(mx * mx + my * my + mz * mz);
-    if (norm > 1e-12f) {
-      mx /= norm;
-      my /= norm;
-      mz /= norm;
-      const float sigma_ahe = static_cast<float>(config_.ahe_ratio * static_cast<double>(s));
-      // Sigma_AHE = sigma_ahe * [[0,-mz,my],[mz,0,-mx],[-my,mx,0]]
-      // Stored upper triangle (xy, xz, yz) = (-mz, my, -mx) * sigma_ahe
-      k.xy += -sigma_ahe * mz;
-      k.xz += sigma_ahe * my;
-      k.yz += -sigma_ahe * mx;
-    }
-  }
   if (config_.the_enabled) {
     if (winding_.size() != 3u * n_xy) {
       throw std::runtime_error("THE enabled but winding has not been computed");
     }
-    const float hx = winding_[base];
-    const float hy = winding_[n_xy + base];
-    const float hz = winding_[2u * n_xy + base];
-    const float sigma_the = static_cast<float>(config_.the_ratio * static_cast<double>(s));
-    // Same skew storage as AHE: (xy, xz, yz) = (-h_z, h_y, -h_x) * sigma_the
-    k.xy += -sigma_the * hz;
-    k.xz += sigma_the * hy;
-    k.yz += -sigma_the * hx;
+    in.hx = winding_[base];
+    in.hy = winding_[n_xy + base];
+    in.hz = winding_[2u * n_xy + base];
   }
-  return k;
+  return in;
+}
+
+SymTensor6 PoissonWorld::sym_tensor_for_cell(int cell) const {
+  const PoissonConductivitySplit split =
+      poisson_conductivity_from_inputs(conductivity_inputs_for_cell(cell));
+  return {split.S.xx, split.S.yy, split.S.zz, split.S.xy, split.S.xz, split.S.yz};
+}
+
+SkewTensor3 PoissonWorld::skew_tensor_for_cell(int cell) const {
+  const PoissonConductivitySplit split =
+      poisson_conductivity_from_inputs(conductivity_inputs_for_cell(cell));
+  return {split.K.xy, split.K.xz, split.K.yz};
 }
 
 void PoissonWorld::refresh_winding_fm_stack() {
@@ -629,8 +645,11 @@ void PoissonWorld::refresh_cell_tensors() {
   sym_tensor_.assign(static_cast<std::size_t>(cell_count()), {});
   skew_tensor_.assign(static_cast<std::size_t>(cell_count()), {});
   for (int cell = 0; cell < cell_count(); ++cell) {
-    sym_tensor_[static_cast<std::size_t>(cell)] = sym_tensor_for_cell(cell);
-    skew_tensor_[static_cast<std::size_t>(cell)] = skew_tensor_for_cell(cell);
+    const PoissonConductivitySplit split =
+        poisson_conductivity_from_inputs(conductivity_inputs_for_cell(cell));
+    sym_tensor_[static_cast<std::size_t>(cell)] = {split.S.xx, split.S.yy, split.S.zz, split.S.xy,
+                                                   split.S.xz, split.S.yz};
+    skew_tensor_[static_cast<std::size_t>(cell)] = {split.K.xy, split.K.xz, split.K.yz};
   }
 }
 
@@ -1006,7 +1025,7 @@ void PoissonWorld::build_scalar_operator() {
 }
 
 void PoissonWorld::build_transport_operators() {
-  if (!magnetization_set_) {
+  if (magnetization_required() && !magnetization_set_) {
     throw std::runtime_error("rebuild_transport_operators requires magnetization");
   }
   refresh_cell_tensors();
@@ -1024,7 +1043,7 @@ void PoissonWorld::build_transport_operators() {
   spd.rows.assign(static_cast<std::size_t>(n_unknown), {});
 
   MatrixBuilder skew;
-  if (config_.ahe_enabled || config_.the_enabled) {
+  if (skew_enabled()) {
     skew.diagonal.assign(static_cast<std::size_t>(n_unknown), 0.0f);
     skew.rhs_weight.assign(static_cast<std::size_t>(num_contacts_),
                            std::vector<float>(static_cast<std::size_t>(n_unknown), 0.0f));
@@ -1077,7 +1096,7 @@ void PoissonWorld::build_transport_operators() {
       const float face_yz = avg_signed(s0.yz, s1.yz);
       add_cross_terms_for_face(spd, cell, nbr, axis, face_xy, face_xz, face_yz, false);
 
-      if (config_.ahe_enabled || config_.the_enabled) {
+      if (skew_enabled()) {
         const float k_xy = avg_signed(k0.xy, k1.xy);
         const float k_xz = avg_signed(k0.xz, k1.xz);
         const float k_yz = avg_signed(k0.yz, k1.yz);
@@ -1090,11 +1109,11 @@ void PoissonWorld::build_transport_operators() {
   finalize_matrix(spd, row_offsets_, col_indices_, offdiag_conductance_, diagonal_,
                   rhs_weight_);
 
-  if (config_.ahe_enabled || config_.the_enabled) {
+  if (skew_enabled()) {
     // Skew diagonals should remain ~0; allow slightly non-positive diagonals.
     for (float& d : skew.diagonal) {
       if (!(std::isfinite(d))) {
-        throw std::runtime_error("non-finite skew diagonal during AHE/THE assembly");
+        throw std::runtime_error("non-finite skew diagonal during AHE/THE/OHE assembly");
       }
       // Keep a tiny positive diagonal so finalize_matrix isolation check still works
       // for rows that only have skew contact couplings and no unknown neighbors.
@@ -1218,7 +1237,8 @@ void PoissonWorld::build_transport_pattern_operators() {
       {{0, 1, 0, 1}},  {{0, 0, -1, 2}}, {{0, 0, 1, 2}},
   }};
 
-  const bool need_cross = config_.amr_enabled || config_.ahe_enabled || config_.the_enabled;
+  const bool need_cross =
+      config_.amr_enabled || config_.ahe_enabled || config_.the_enabled || config_.ohe_enabled;
   const int plane = meta_.nx * meta_.ny;
   for (int row = 0; row < n_unknown; ++row) {
     const int cell = unknown_to_cell_[static_cast<std::size_t>(row)];

@@ -79,7 +79,9 @@ PoissonCudaSession::PoissonCudaSession(PoissonWorld world,
                                        int cuda_tol_batch_next,
                                        TransportConfig transport,
                                        PoissonLinearSolverKind solver_kind,
-                                       int gmres_restart)
+                                       std::vector<int> gmres_restart,
+                                       bool voltage_scale_guess,
+                                       PoissonPreconditionerKind preconditioner)
     : world_(std::move(world)),
       potentials_(std::move(potentials)),
       output_spec_(make_jmod_output_spec(world_, slice_x, slice_y, slice_z)),
@@ -87,9 +89,11 @@ PoissonCudaSession::PoissonCudaSession(PoissonWorld world,
       gmres_solver_(world_),
       transport_config_(transport),
       solver_kind_(solver_kind),
+      preconditioner_(preconditioner),
       tolerance_(tolerance),
       max_iterations_(max_iterations),
       skip_threshold_(skip_threshold),
+      voltage_scale_guess_(voltage_scale_guess),
       x_(static_cast<std::size_t>(world_.unknown_count()), 0.0),
       phi_(static_cast<std::size_t>(world_.cell_count()), 0.0f),
       j_frame_(world_.frame_elements(), 0.0f),
@@ -123,7 +127,17 @@ PoissonCudaSession::PoissonCudaSession(PoissonWorld world,
   pcg_solver_.set_tolerance(tolerance_);
   pcg_solver_.set_tolerance_check_batches(cuda_tol_batch_first, cuda_tol_batch_next);
   gmres_solver_.set_tolerance(tolerance_);
-  gmres_solver_.set_restart(gmres_restart);
+  gmres_solver_.set_preconditioner(preconditioner_);
+  gmres_solver_.set_restart_schedule(gmres_restart);
+  if (preconditioner_ == PoissonPreconditionerKind::kGmg) {
+    if (solver_kind_ != PoissonLinearSolverKind::kGmresCusparse) {
+      throw std::runtime_error("preconditioner='gmg' requires solver='gmres_cusparse'");
+    }
+    if (!world_.transport_enabled()) {
+      throw std::runtime_error("preconditioner='gmg' requires a transport operator");
+    }
+    gmres_solver_.build_gmg(world_);
+  }
 }
 
 PoissonCudaSession::~PoissonCudaSession() {
@@ -214,6 +228,9 @@ int PoissonCudaSession::initial_max_iterations(int max_iterations) {
 void PoissonCudaSession::reset() {
   step_ = 0;
   first_solve_ = true;
+  last_voltage_scale_applied_ = false;
+  last_voltage_scale_alpha_ = 1.0;
+  last_solved_applied_.clear();
   std::fill(x_.begin(), x_.end(), 0.0);
   pcg_solver_.reset_solution();
   gmres_solver_.reset_solution();
@@ -223,6 +240,37 @@ void PoissonCudaSession::reset() {
   last_frame_skipped_ = false;
   hall_voltages_.clear();
   hall_components_ = HallPotentialComponents{};
+}
+
+void PoissonCudaSession::maybe_scale_voltage_guess() {
+  last_voltage_scale_applied_ = false;
+  last_voltage_scale_alpha_ = 1.0;
+  if (!voltage_scale_guess_ || solver_kind_ != PoissonLinearSolverKind::kGmresCusparse) {
+    return;
+  }
+  if (last_solved_applied_.empty() || last_solved_applied_.size() != applied_.size()) {
+    return;
+  }
+  double numer = 0.0;
+  double denom = 0.0;
+  for (std::size_t i = 0; i < applied_.size(); ++i) {
+    numer += applied_[i] * last_solved_applied_[i];
+    denom += last_solved_applied_[i] * last_solved_applied_[i];
+  }
+  if (!(denom > 0.0) || !std::isfinite(numer) || !std::isfinite(denom)) {
+    return;
+  }
+  const double alpha = numer / denom;
+  if (!std::isfinite(alpha)) {
+    return;
+  }
+  gmres_solver_.scale_solution(alpha);
+  last_voltage_scale_applied_ = true;
+  last_voltage_scale_alpha_ = alpha;
+}
+
+void PoissonCudaSession::remember_solved_contact_voltages() {
+  last_solved_applied_ = applied_;
 }
 
 StepStats PoissonCudaSession::iterate() {
@@ -310,10 +358,14 @@ StepStats PoissonCudaSession::iterate_with_magnetization_device(
     stats.timing_transport_rebuild_s = 0.0;
     stats.timing_operator_upload_s = 0.0;
     const auto t_solve0 = Clock::now();
+    maybe_scale_voltage_guess();
     PcgResult result = gmres_solver_.solve_device_rhs(x_);
     stats.timing_linear_solve_s = seconds_between(t_solve0, Clock::now());
     stats.stats_note =
-        "gmres_cusparse_jacobi_device_update err=" + std::to_string(result.residual_relative);
+        std::string(gmres_solver_.preconditioner() == PoissonPreconditionerKind::kGmg
+                        ? "gmres_cusparse_gmg_device_update err="
+                        : "gmres_cusparse_jacobi_device_update err=") +
+        std::to_string(result.residual_relative);
     const auto t1 = Clock::now();
     stats.timing_total_s = seconds_between(iter_t0, t1);
     return finish_iterate_after_solve(stats, result, 0.0, 0, seconds_between(t0, t1));
@@ -358,13 +410,15 @@ StepStats PoissonCudaSession::iterate_impl(const std::vector<float>* magnetizati
 
   if (world_.transport_enabled()) {
     const auto t_transport0 = Clock::now();
-    if (magnetization_fm_stack == nullptr) {
+    if (world_.magnetization_required() && magnetization_fm_stack == nullptr) {
       throw std::runtime_error(
           "PoissonCudaSession: magnetization is required when AMR/AHE/THE transport is enabled");
     }
-    const auto t_mset0 = Clock::now();
-    world_.set_magnetization_fm_stack(*magnetization_fm_stack);
-    stats.timing_magnetization_set_s = seconds_between(t_mset0, Clock::now());
+    if (magnetization_fm_stack != nullptr) {
+      const auto t_mset0 = Clock::now();
+      world_.set_magnetization_fm_stack(*magnetization_fm_stack);
+      stats.timing_magnetization_set_s = seconds_between(t_mset0, Clock::now());
+    }
 
     if (solver_kind_ == PoissonLinearSolverKind::kGmresCusparse &&
         !poisson_gmres_force_host_rebuild()) {
@@ -381,17 +435,25 @@ StepStats PoissonCudaSession::iterate_impl(const std::vector<float>* magnetizati
 
       const auto t0 = Clock::now();
       const auto t_update0 = Clock::now();
-      gmres_solver_.update_transport_operator_and_rhs_device(world_, *magnetization_fm_stack,
+      if (magnetization_fm_stack != nullptr) {
+        gmres_solver_.update_transport_operator_and_rhs_device(world_, *magnetization_fm_stack,
                                                              applied_);
+      } else {
+        gmres_solver_.update_transport_operator_and_rhs_device(world_, applied_);
+      }
       stats.timing_transport_s = seconds_between(t_update0, Clock::now());
       stats.timing_transport_rebuild_s = 0.0;
       stats.timing_operator_upload_s = 0.0;
       stats.timing_rhs_build_s = 0.0;
       const auto t_solve0 = Clock::now();
+      maybe_scale_voltage_guess();
       PcgResult result = gmres_solver_.solve_device_rhs(x_);
       stats.timing_linear_solve_s = seconds_between(t_solve0, Clock::now());
       stats.stats_note =
-          "gmres_cusparse_jacobi_device_update err=" + std::to_string(result.residual_relative);
+          std::string(gmres_solver_.preconditioner() == PoissonPreconditionerKind::kGmg
+                          ? "gmres_cusparse_gmg_device_update err="
+                          : "gmres_cusparse_jacobi_device_update err=") +
+          std::to_string(result.residual_relative);
       const auto t1 = Clock::now();
       stats.timing_total_s = seconds_between(iter_t0, t1);
       return finish_iterate_after_solve(stats, result, 0.0, 0, seconds_between(t0, t1));
@@ -439,9 +501,13 @@ StepStats PoissonCudaSession::iterate_impl(const std::vector<float>* magnetizati
     }
     stats.timing_rhs_build_s = seconds_between(t_rhs0, Clock::now());
     const auto t_solve0 = Clock::now();
+    maybe_scale_voltage_guess();
     result = gmres_solver_.solve(rhs_, x_);
     stats.timing_linear_solve_s = seconds_between(t_solve0, Clock::now());
-    stats.stats_note = "gmres_cusparse_jacobi err=" + std::to_string(result.residual_relative);
+    stats.stats_note = std::string(gmres_solver_.preconditioner() == PoissonPreconditionerKind::kGmg
+                                       ? "gmres_cusparse_gmg err="
+                                       : "gmres_cusparse_jacobi err=") +
+                       std::to_string(result.residual_relative);
   } else if (world_.transport_enabled() && world_.skew_enabled()) {
     const auto t_rhs0 = Clock::now();
     world_.build_rhs_spd(applied_, rhs_s_);
@@ -483,6 +549,11 @@ StepStats PoissonCudaSession::finish_iterate_after_solve(StepStats stats,
   const auto finish_t0 = Clock::now();
   if (result.numerical_failure) {
     throw std::runtime_error("PoissonCudaSession: CUDA linear solver numerical failure");
+  }
+
+  remember_solved_contact_voltages();
+  if (last_voltage_scale_applied_) {
+    stats.stats_note += " voltage_scale=" + std::to_string(last_voltage_scale_alpha_);
   }
 
   stats.iterations = result.iterations;
@@ -531,6 +602,16 @@ StepStats PoissonCudaSession::finish_iterate_after_solve(StepStats stats,
 
   ++step_;
   return stats;
+}
+
+void PoissonCudaSession::set_applied_field_uniform(float bx, float by, float bz) {
+  world_.set_applied_field_uniform(bx, by, bz);
+  gmres_solver_.set_applied_field_uniform(bx, by, bz);
+}
+
+void PoissonCudaSession::set_applied_field_grid(const std::vector<float>& b_poisson) {
+  world_.set_applied_field_grid(b_poisson);
+  gmres_solver_.set_applied_field_grid(b_poisson.data(), b_poisson.size());
 }
 
 void PoissonCudaSession::set_hall_probe_indices(HallProbeIndices probes) {

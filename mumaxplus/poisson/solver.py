@@ -101,6 +101,33 @@ class HallPotentialResult:
 
 
 @dataclass(frozen=True)
+class HallPotentialLayers:
+    """Independent Hall voltages for named z selections (never averaged).
+
+    ``contact`` uses drive-contact z layers (Pt in the packaged FGaT world).
+    ``fm`` uses conducting FM layers. ``pt`` uses conducting Pt layers.
+    Missing locations are ``None``.
+    """
+
+    locations: Tuple[str, ...]
+    contact: Optional[np.ndarray] = None
+    fm: Optional[np.ndarray] = None
+    pt: Optional[np.ndarray] = None
+    contact_result: Optional[HallPotentialResult] = None
+    fm_result: Optional[HallPotentialResult] = None
+    pt_result: Optional[HallPotentialResult] = None
+
+    def __getitem__(self, key: str) -> Optional[np.ndarray]:
+        if key == "contact":
+            return self.contact
+        if key == "fm":
+            return self.fm
+        if key == "pt":
+            return self.pt
+        raise KeyError(f"unknown Hall location {key!r}")
+
+
+@dataclass(frozen=True)
 class PoissonStepStats:
     """Solver statistics for one ``CudaPoissonSolver.iterate`` call."""
 
@@ -494,6 +521,12 @@ def _resolve_hall_z_layers(
         isinstance(v, (int, np.integer)) for v in z_mode
     ):
         layers = tuple(int(v) for v in z_mode)
+    elif z_mode == "both":
+        raise ValueError(
+            "z_mode='both' cannot build a single HallContactGeometry; "
+            "use CudaPoissonSolver.hall_layer_potentials() or "
+            "hall_potentials(z_mode='both')"
+        )
     else:
         raise ValueError(
             "z_mode must be 'contact', 'pt', 'fm', a sequence of z indices, "
@@ -505,6 +538,49 @@ def _resolve_hall_z_layers(
         if iz < 0 or iz >= nz:
             raise ValueError(f"Hall z layer {iz} out of range [0, {nz})")
     return layers
+
+
+_HALL_NAMED_Z_MODES = frozenset({"contact", "pt", "fm"})
+_HALL_BOTH_LOCATIONS = ("contact", "fm")
+
+
+def _normalize_hall_locations(locations: Any) -> Tuple[str, ...]:
+    if locations is None or locations == "both":
+        return _HALL_BOTH_LOCATIONS
+    if isinstance(locations, str):
+        if locations in _HALL_NAMED_Z_MODES:
+            return (locations,)
+        raise ValueError(
+            "locations must be 'contact', 'pt', 'fm', 'both', or a sequence of those"
+        )
+    if isinstance(locations, (list, tuple)):
+        out: list[str] = []
+        for loc in locations:
+            if loc == "both":
+                out.extend(_HALL_BOTH_LOCATIONS)
+            elif loc in _HALL_NAMED_Z_MODES:
+                out.append(str(loc))
+            else:
+                raise ValueError(
+                    "locations must be 'contact', 'pt', 'fm', 'both', or a sequence of those"
+                )
+        if not out:
+            raise ValueError("locations sequence is empty")
+        return tuple(dict.fromkeys(out))
+    raise ValueError(
+        "locations must be 'contact', 'pt', 'fm', 'both', or a sequence of those"
+    )
+
+
+def _is_multi_hall_z_mode(z_mode: Any) -> bool:
+    if z_mode == "both":
+        return True
+    return (
+        isinstance(z_mode, (list, tuple))
+        and len(z_mode) > 0
+        and z_mode[0] != "layers"
+        and all(isinstance(v, str) for v in z_mode)
+    )
 
 
 def resolve_hall_contact_geometry(
@@ -1169,6 +1245,9 @@ def _validate_transport_args(
     the_enabled: bool,
     the_ratio: float,
     picard_sweeps: int,
+    ohe_enabled: bool = True,
+    hall_coefficient_pt: float = -2.44e-11,
+    hall_coefficient_fm: float = 3.09e-10,
 ) -> None:
     if not amr_enabled and float(amr_ratio) != 0.0:
         raise ValueError("amr_ratio requires amr_enabled=True")
@@ -1182,8 +1261,12 @@ def _validate_transport_args(
         raise ValueError("ahe_ratio must be finite when AHE is enabled")
     if the_enabled and not np.isfinite(float(the_ratio)):
         raise ValueError("the_ratio must be finite when THE is enabled")
-    if (ahe_enabled or the_enabled) and int(picard_sweeps) < 1:
-        raise ValueError("picard_sweeps must be >= 1 when AHE or THE is enabled")
+    if ohe_enabled and (
+        not np.isfinite(float(hall_coefficient_pt)) or not np.isfinite(float(hall_coefficient_fm))
+    ):
+        raise ValueError("Hall coefficients must be finite when OHE is enabled")
+    if (ahe_enabled or the_enabled or ohe_enabled) and int(picard_sweeps) < 1:
+        raise ValueError("picard_sweeps must be >= 1 when AHE, THE, or OHE is enabled")
 
 
 def _normalize_linear_solver(solver: str) -> str:
@@ -1193,6 +1276,30 @@ def _normalize_linear_solver(solver: str) -> str:
     if name not in {"pcg", "gmres_cusparse"}:
         raise ValueError("solver must be 'pcg' or 'gmres_cusparse'")
     return name
+
+
+def _normalize_preconditioner(preconditioner: str, solver: str) -> str:
+    name = str(preconditioner).strip().lower()
+    if name not in {"jacobi", "gmg"}:
+        raise ValueError("preconditioner must be 'jacobi' or 'gmg'")
+    if name == "gmg" and solver != "gmres_cusparse":
+        raise ValueError("preconditioner='gmg' requires solver='gmres_cusparse'")
+    return name
+
+
+def _normalize_gmres_restart(gmres_restart: Any) -> Tuple[int, ...]:
+    if isinstance(gmres_restart, (int, np.integer)):
+        values = (int(gmres_restart),)
+    else:
+        values = tuple(int(v) for v in gmres_restart)
+        if not values:
+            raise ValueError("gmres_restart sequence cannot be empty")
+    if values[0] < 2:
+        raise ValueError("finest gmres_restart must be >= 2")
+    for value in values:
+        if value < 0 or value == 1:
+            raise ValueError("gmres_restart entries must be 0 or >= 2")
+    return values
 
 
 def _normalize_magnetization_frame(
@@ -1238,6 +1345,16 @@ class CudaPoissonSolver:
     This class is intentionally separate from ``mumaxplus.PoissonSystem``. Its
     world geometry can come from the packaged default manifest, an explicit
     manifest path, or a :class:`WorldSpec`.
+
+    GMRES may use ``preconditioner="jacobi"`` (default) or ``"gmg"`` (geometric
+    multigrid V-cycle on the frozen 7-point scalar-conductivity operator, with
+    no AMR/AHE/THE/OHE). ``gmres_restart`` may
+    be an int (finest level) or a per-level sequence.
+
+    ``resistivity_invert=True`` builds each anisotropic cell tensor by inverting
+    a resistivity (AMR plus one Hall vector). The flag is fixed at construction.
+    The GMG preconditioner always uses scalar conductivity. Default is additive
+    ``Σ = Σ_AMR + Σ_OHE + Σ_AHE + Σ_THE``.
     """
 
     def __init__(
@@ -1246,7 +1363,7 @@ class CudaPoissonSolver:
         world: Optional[WorldSpec] = None,
         manifest_path: Optional[str] = None,
         contact_potentials: Any,
-        tol: float = 1e-5,
+        tol: float = 1e-6,
         max_iter: int = 2000,
         skip_threshold: float = 1e-5,
         fm_nz: Optional[str] = None,
@@ -1263,14 +1380,30 @@ class CudaPoissonSolver:
         ahe_ratio: float = 0.0,
         the_enabled: bool = False,
         the_ratio: float = 0.0,
+        ohe_enabled: bool = True,
+        hall_coefficient_pt: float = -2.44e-11,
+        hall_coefficient_fm: float = 3.09e-10,
         picard_sweeps: int = 2,
         picard_tolerance: float = 0.0,
+        resistivity_invert: bool = False,
         solver: str = "gmres_cusparse",
-        gmres_restart: int = 50,
+        gmres_restart: Union[int, Sequence[int]] = 200,
+        voltage_scale_guess: bool = False,
+        preconditioner: str = "jacobi",
+        applied_field: Any = None,
     ) -> None:
         potentials = _normalize_contact_potentials(contact_potentials)
         _validate_transport_args(
-            amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled, the_ratio, picard_sweeps
+            amr_enabled,
+            amr_ratio,
+            ahe_enabled,
+            ahe_ratio,
+            the_enabled,
+            the_ratio,
+            picard_sweeps,
+            ohe_enabled,
+            hall_coefficient_pt,
+            hall_coefficient_fm,
         )
 
         if world is not None and manifest_path is not None:
@@ -1291,18 +1424,29 @@ class CudaPoissonSolver:
         self._amr_enabled = bool(amr_enabled)
         self._ahe_enabled = bool(ahe_enabled)
         self._the_enabled = bool(the_enabled)
+        self._ohe_enabled = bool(ohe_enabled)
         self._amr_ratio = float(amr_ratio)
         self._ahe_ratio = float(ahe_ratio)
         self._the_ratio = float(the_ratio)
+        self._hall_coefficient_pt = float(hall_coefficient_pt)
+        self._hall_coefficient_fm = float(hall_coefficient_fm)
         self._picard_sweeps = int(picard_sweeps)
         self._picard_tolerance = float(picard_tolerance)
+        self._resistivity_invert = bool(resistivity_invert)
         self._transport_enabled = bool(
+            self._amr_enabled
+            or self._ahe_enabled
+            or self._the_enabled
+            or self._ohe_enabled
+        )
+        self._magnetization_required = bool(
             self._amr_enabled or self._ahe_enabled or self._the_enabled
         )
         self._solver = _normalize_linear_solver(solver)
-        self._gmres_restart = int(gmres_restart)
-        if self._gmres_restart < 2:
-            raise ValueError("gmres_restart must be >= 2")
+        self._preconditioner = _normalize_preconditioner(preconditioner, self._solver)
+        self._gmres_restart_scalar = isinstance(gmres_restart, (int, np.integer))
+        self._gmres_restart_values = _normalize_gmres_restart(gmres_restart)
+        self._voltage_scale_guess = bool(voltage_scale_guess)
 
         transport_kwargs = {
             "amr_enabled": self._amr_enabled,
@@ -1313,8 +1457,18 @@ class CudaPoissonSolver:
             "the_ratio": self._the_ratio,
             "picard_sweeps": self._picard_sweeps,
             "picard_tolerance": self._picard_tolerance,
+            "ohe_enabled": self._ohe_enabled,
+            "hall_coefficient_pt": self._hall_coefficient_pt,
+            "hall_coefficient_fm": self._hall_coefficient_fm,
+            "resistivity_invert": self._resistivity_invert,
             "solver": self._solver,
-            "gmres_restart": self._gmres_restart,
+            "gmres_restart": (
+                self._gmres_restart_values[0]
+                if self._gmres_restart_scalar
+                else list(self._gmres_restart_values)
+            ),
+            "voltage_scale_guess": self._voltage_scale_guess,
+            "preconditioner": self._preconditioner,
         }
 
         if world is None:
@@ -1368,6 +1522,8 @@ class CudaPoissonSolver:
             fm_height=fm_height,
             fm_mumax_nz=fm_mumax_nz,
         )
+        if applied_field is not None:
+            self.set_applied_field(applied_field)
 
     @classmethod
     def from_signal_file(
@@ -1379,7 +1535,7 @@ class CudaPoissonSolver:
         v_scale: float = 0.005,
         skip_first: int = 1000,
         num_contacts: int = 3,
-        tol: float = 1e-5,
+        tol: float = 1e-6,
         max_iter: int = 2000,
         skip_threshold: float = 1e-5,
         fm_nz: Optional[str] = None,
@@ -1396,15 +1552,31 @@ class CudaPoissonSolver:
         ahe_ratio: float = 0.0,
         the_enabled: bool = False,
         the_ratio: float = 0.0,
+        ohe_enabled: bool = True,
+        hall_coefficient_pt: float = -2.44e-11,
+        hall_coefficient_fm: float = 3.09e-10,
         picard_sweeps: int = 2,
         picard_tolerance: float = 0.0,
+        resistivity_invert: bool = False,
         solver: str = "gmres_cusparse",
-        gmres_restart: int = 50,
+        gmres_restart: Union[int, Sequence[int]] = 200,
+        voltage_scale_guess: bool = False,
+        preconditioner: str = "jacobi",
+        applied_field: Any = None,
     ) -> "CudaPoissonSolver":
         """Construct from a single-column signal file using C++ resampling rules."""
 
         _validate_transport_args(
-            amr_enabled, amr_ratio, ahe_enabled, ahe_ratio, the_enabled, the_ratio, picard_sweeps
+            amr_enabled,
+            amr_ratio,
+            ahe_enabled,
+            ahe_ratio,
+            the_enabled,
+            the_ratio,
+            picard_sweeps,
+            ohe_enabled,
+            hall_coefficient_pt,
+            hall_coefficient_fm,
         )
         manifest = manifest_path or default_world_path()
         first_r2 = _parse_first_r2_from_manifest(manifest)
@@ -1420,16 +1592,26 @@ class CudaPoissonSolver:
         obj._amr_enabled = bool(amr_enabled)
         obj._ahe_enabled = bool(ahe_enabled)
         obj._the_enabled = bool(the_enabled)
+        obj._ohe_enabled = bool(ohe_enabled)
         obj._amr_ratio = float(amr_ratio)
         obj._ahe_ratio = float(ahe_ratio)
         obj._the_ratio = float(the_ratio)
+        obj._hall_coefficient_pt = float(hall_coefficient_pt)
+        obj._hall_coefficient_fm = float(hall_coefficient_fm)
         obj._picard_sweeps = int(picard_sweeps)
         obj._picard_tolerance = float(picard_tolerance)
-        obj._transport_enabled = bool(obj._amr_enabled or obj._ahe_enabled or obj._the_enabled)
+        obj._resistivity_invert = bool(resistivity_invert)
+        obj._transport_enabled = bool(
+            obj._amr_enabled or obj._ahe_enabled or obj._the_enabled or obj._ohe_enabled
+        )
+        obj._magnetization_required = bool(
+            obj._amr_enabled or obj._ahe_enabled or obj._the_enabled
+        )
         obj._solver = _normalize_linear_solver(solver)
-        obj._gmres_restart = int(gmres_restart)
-        if obj._gmres_restart < 2:
-            raise ValueError("gmres_restart must be >= 2")
+        obj._preconditioner = _normalize_preconditioner(preconditioner, obj._solver)
+        obj._gmres_restart_scalar = isinstance(gmres_restart, (int, np.integer))
+        obj._gmres_restart_values = _normalize_gmres_restart(gmres_restart)
+        obj._voltage_scale_guess = bool(voltage_scale_guess)
         obj._impl = _cpp.PoissonCudaSolver.from_signal_file(
             manifest,
             signal_path,
@@ -1453,8 +1635,16 @@ class CudaPoissonSolver:
             float(the_ratio),
             int(picard_sweeps),
             float(picard_tolerance),
+            bool(ohe_enabled),
+            float(hall_coefficient_pt),
+            float(hall_coefficient_fm),
+            bool(resistivity_invert),
             obj._solver,
-            obj._gmres_restart,
+            obj._gmres_restart_values[0]
+            if obj._gmres_restart_scalar
+            else list(obj._gmres_restart_values),
+            obj._voltage_scale_guess,
+            obj._preconditioner,
         )
         obj._first_r2_layer = int(obj._impl.first_r2_layer)
         obj._configure_fm_export(
@@ -1462,6 +1652,8 @@ class CudaPoissonSolver:
             fm_height=fm_height,
             fm_mumax_nz=fm_mumax_nz,
         )
+        if applied_field is not None:
+            obj.set_applied_field(applied_field)
         return obj
 
     def _configure_fm_export(
@@ -1604,9 +1796,15 @@ class CudaPoissonSolver:
 
     @property
     def transport_enabled(self) -> bool:
-        """Whether AMR, AHE, and/or THE transport is enabled."""
+        """Whether AMR, AHE, THE, and/or OHE transport is enabled."""
 
         return self._transport_enabled
+
+    @property
+    def magnetization_required(self) -> bool:
+        """Whether iterate() needs magnetization (AMR, AHE, or THE)."""
+
+        return self._magnetization_required
 
     @property
     def amr_enabled(self) -> bool:
@@ -1621,6 +1819,16 @@ class CudaPoissonSolver:
         return self._the_enabled
 
     @property
+    def ohe_enabled(self) -> bool:
+        return self._ohe_enabled
+
+    @property
+    def resistivity_invert(self) -> bool:
+        """Whether cell tensors come from a resistivity invert (fixed at construction)."""
+
+        return self._resistivity_invert
+
+    @property
     def amr_ratio(self) -> float:
         return self._amr_ratio
 
@@ -1633,6 +1841,14 @@ class CudaPoissonSolver:
         return self._the_ratio
 
     @property
+    def hall_coefficient_pt(self) -> float:
+        return self._hall_coefficient_pt
+
+    @property
+    def hall_coefficient_fm(self) -> float:
+        return self._hall_coefficient_fm
+
+    @property
     def picard_sweeps(self) -> int:
         return self._picard_sweeps
 
@@ -1642,10 +1858,61 @@ class CudaPoissonSolver:
 
         return self._solver
 
+    @property
+    def preconditioner(self) -> str:
+        """GMRES preconditioner: ``"jacobi"`` (default) or ``"gmg"``."""
+
+        return self._preconditioner
+
+    @property
+    def gmres_restart(self) -> Union[int, Tuple[int, ...]]:
+        """Outer / per-level GMRES restart. An int applies to the finest level."""
+
+        if self._gmres_restart_scalar:
+            return self._gmres_restart_values[0]
+        return self._gmres_restart_values
+
+    @property
+    def voltage_scale_guess(self) -> bool:
+        """Whether GMRES scales the on-device guess by last-solved contact voltages."""
+
+        return self._voltage_scale_guess
+
     def reset(self) -> None:
         """Restart from contact frame zero and clear the CUDA warm start."""
 
         self._impl.reset()
+
+    def set_applied_field(self, field: Any) -> None:
+        """Set the applied magnetic field used by ordinary Hall (Tesla).
+
+        Accepts a length-3 sequence ``(Bx, By, Bz)`` (uniform) or an array of
+        shape ``(3, nz, ny, nx)`` matching :attr:`world_shape`.
+        """
+
+        arr = np.asarray(field, dtype=np.float32)
+        if arr.shape == (3,):
+            set_fn = getattr(self._impl, "set_applied_field_uniform", None)
+            if set_fn is None:
+                raise RuntimeError(
+                    "native Poisson solver does not expose set_applied_field_uniform; "
+                    "rebuild mumaxplus"
+                )
+            set_fn(float(arr[0]), float(arr[1]), float(arr[2]))
+            return
+        expected = (3,) + self.world_shape
+        if arr.shape != expected:
+            raise ValueError(
+                f"applied_field shape {arr.shape} is invalid; expected (3,) or {expected}"
+            )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("applied_field contains NaN or Inf")
+        set_grid = getattr(self._impl, "set_applied_field_grid", None)
+        if set_grid is None:
+            raise RuntimeError(
+                "native Poisson solver does not expose set_applied_field_grid; rebuild mumaxplus"
+            )
+        set_grid(np.ascontiguousarray(arr, dtype=np.float32))
 
     def _world_spec_for_hall(self) -> WorldSpec:
         if self._world_spec is not None:
@@ -1719,7 +1986,7 @@ class CudaPoissonSolver:
         self._hall_z_mode = z_mode
         return geom
 
-    def hall_potentials(
+    def _hall_readout_single(
         self,
         geometry: Any = "auto",
         *,
@@ -1728,32 +1995,6 @@ class CudaPoissonSolver:
         low_y_masks: Any = None,
         return_components: bool = False,
     ) -> Union[np.ndarray, HallPotentialResult]:
-        """Return transverse Hall voltages for each applied-potential contact.
-
-        Requires at least one prior ``iterate()`` call. Geometry defaults to an
-        automatic Hall-bar layout: virtual probes mirror applied contact size
-        and spacing, rotated onto the low-y and high-y edges. Values are in
-        volts with sign ``mean(phi_high_y) - mean(phi_low_y)``.
-
-        Parameters
-        ----------
-        geometry : ``"auto"`` or :class:`HallContactGeometry`, optional
-            Probe layout. Default resolves from the Poisson world.
-        z_mode : str or sequence, optional
-            Z selection for auto geometry: ``"contact"`` (default), ``"pt"``,
-            ``"fm"``, or an explicit layer index sequence.
-        high_y_masks, low_y_masks : array_like, optional
-            Custom boolean masks shaped ``(nz, ny, nx)`` or
-            ``(num_contacts, nz, ny, nx)``.
-        return_components : bool, optional
-            If True, return a :class:`HallPotentialResult` with means/counts.
-
-        Returns
-        -------
-        numpy.ndarray or HallPotentialResult
-            ``float64`` array of shape ``(num_contacts,)`` by default.
-        """
-
         geom = self._ensure_hall_geometry_configured(
             geometry,
             z_mode=z_mode,
@@ -1782,6 +2023,136 @@ class CudaPoissonSolver:
                 "native Poisson solver does not expose hall_potentials; rebuild mumaxplus"
             )
         return np.ascontiguousarray(voltages_fn(), dtype=np.float64)
+
+    def hall_layer_potentials(
+        self,
+        locations: Any = "both",
+        *,
+        geometry: Any = "auto",
+        high_y_masks: Any = None,
+        low_y_masks: Any = None,
+        return_components: bool = False,
+    ) -> HallPotentialLayers:
+        """Return Hall voltages on contact, FM, Pt, or several of those layers.
+
+        Each requested location is an independent probe set on the current
+        potential; values are not averaged together. ``"both"`` is contact
+        (drive-contact z, Pt in FGaT) plus FM.
+
+        Parameters
+        ----------
+        locations : str or sequence, optional
+            ``"contact"``, ``"fm"``, ``"pt"``, ``"both"`` (default), or a
+            sequence of those names.
+        geometry : ``"auto"``, optional
+            Must stay automatic: custom masks already fix the z cells.
+        return_components : bool, optional
+            If True, also attach a :class:`HallPotentialResult` per location.
+
+        Returns
+        -------
+        HallPotentialLayers
+            Named ``float64`` arrays of shape ``(num_contacts,)``. Unused
+            locations are ``None``.
+        """
+
+        if (
+            isinstance(geometry, HallContactGeometry)
+            or high_y_masks is not None
+            or low_y_masks is not None
+            or (geometry not in (None, "auto"))
+        ):
+            raise ValueError(
+                "hall_layer_potentials() uses auto z selections; pass custom "
+                "probes to hall_potentials() instead"
+            )
+        locs = _normalize_hall_locations(locations)
+        voltages: Dict[str, np.ndarray] = {}
+        results: Dict[str, HallPotentialResult] = {}
+        for loc in locs:
+            raw = self._hall_readout_single(
+                "auto",
+                z_mode=loc,
+                return_components=True,
+            )
+            assert isinstance(raw, HallPotentialResult)
+            voltages[loc] = np.array(raw.voltages, dtype=np.float64, copy=True)
+            results[loc] = raw
+        return HallPotentialLayers(
+            locations=locs,
+            contact=voltages.get("contact"),
+            fm=voltages.get("fm"),
+            pt=voltages.get("pt"),
+            contact_result=results.get("contact") if return_components else None,
+            fm_result=results.get("fm") if return_components else None,
+            pt_result=results.get("pt") if return_components else None,
+        )
+
+    def hall_potentials(
+        self,
+        geometry: Any = "auto",
+        *,
+        z_mode: Any = "contact",
+        high_y_masks: Any = None,
+        low_y_masks: Any = None,
+        return_components: bool = False,
+    ) -> Union[np.ndarray, HallPotentialResult, HallPotentialLayers]:
+        """Return transverse Hall voltages for each applied-potential contact.
+
+        Requires at least one prior ``iterate()`` call. Geometry defaults to an
+        automatic Hall-bar layout: virtual probes mirror applied contact size
+        and spacing, rotated onto the low-y and high-y edges. Values are in
+        volts with sign ``mean(phi_high_y) - mean(phi_low_y)``.
+
+        Parameters
+        ----------
+        geometry : ``"auto"`` or :class:`HallContactGeometry`, optional
+            Probe layout. Default resolves from the Poisson world.
+        z_mode : str or sequence, optional
+            Z selection for auto geometry: ``"contact"`` (default), ``"pt"``,
+            ``"fm"``, an explicit layer index sequence, or ``"both"`` (contact
+            and FM as two independent arrays, not averaged). A sequence of
+            ``"contact"`` / ``"pt"`` / ``"fm"`` is also accepted.
+        high_y_masks, low_y_masks : array_like, optional
+            Custom boolean masks shaped ``(nz, ny, nx)`` or
+            ``(num_contacts, nz, ny, nx)``.
+        return_components : bool, optional
+            If True, return a :class:`HallPotentialResult` with means/counts
+            (or per-location results when ``z_mode`` selects several layers).
+
+        Returns
+        -------
+        numpy.ndarray, HallPotentialResult, or HallPotentialLayers
+            ``float64`` array of shape ``(num_contacts,)`` by default.
+            ``z_mode="both"`` returns :class:`HallPotentialLayers`.
+        """
+
+        if _is_multi_hall_z_mode(z_mode):
+            locs = _normalize_hall_locations(
+                "both" if z_mode == "both" else z_mode
+            )
+            if len(locs) == 1:
+                return self._hall_readout_single(
+                    geometry,
+                    z_mode=locs[0],
+                    high_y_masks=high_y_masks,
+                    low_y_masks=low_y_masks,
+                    return_components=return_components,
+                )
+            return self.hall_layer_potentials(
+                locs,
+                geometry=geometry,
+                high_y_masks=high_y_masks,
+                low_y_masks=low_y_masks,
+                return_components=return_components,
+            )
+        return self._hall_readout_single(
+            geometry,
+            z_mode=z_mode,
+            high_y_masks=high_y_masks,
+            low_y_masks=low_y_masks,
+            return_components=return_components,
+        )
 
     def winding(self) -> np.ndarray:
         """Return per-cell 3D winding ``h``, mumax layout ``(3, nz_export, ny, nx)``.
@@ -2009,7 +2380,11 @@ class CudaPoissonSolver:
             out[:, iz, ...] = _interp_poisson_stack_at_z(arr, z_mid, poisson_cz)
         return out
 
-    def iterate(self, magnetization: Optional[Any] = None) -> PoissonStepResult:
+    def iterate(
+        self,
+        magnetization: Optional[Any] = None,
+        applied_field: Any = None,
+    ) -> PoissonStepResult:
         """Solve the next contact-potential frame.
 
         Parameters
@@ -2017,10 +2392,13 @@ class CudaPoissonSolver:
         magnetization : array_like, optional
             Magnetization in mumax layout ``(3, nz_export, ny, nx)`` or
             ``(3, ny, nx)``. Required when AMR/AHE/THE transport is enabled
-            (except for skipped near-zero contact frames). Ignored on the
-            scalar path. If ``nz_export`` is smaller than the Poisson FM
+            (except for skipped near-zero contact frames). Ignored when only
+            ordinary Hall is on. If ``nz_export`` is smaller than the Poisson FM
             stack, the solver averages mumax z-layers and broadcasts that
             uniform-z magnetization across all Poisson FM layers.
+        applied_field : array_like, optional
+            Uniform ``(Bx, By, Bz)`` in Tesla or a full-grid array
+            ``(3, nz, ny, nx)``. Updates ordinary Hall for this frame.
 
         Returns
         -------
@@ -2030,9 +2408,12 @@ class CudaPoissonSolver:
             mutate previously returned arrays.
         """
 
+        if applied_field is not None:
+            self.set_applied_field(applied_field)
+
         timing_python_magnetization_s = 0.0
         timing_native_call_s = 0.0
-        if self._transport_enabled:
+        if self._magnetization_required or magnetization is not None:
             if magnetization is not None:
                 from mumaxplus.variable import Variable
 
