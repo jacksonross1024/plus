@@ -516,8 +516,8 @@ def test_parse_fm_nz_spec():
     assert poisson.parse_fm_nz_spec("0", 4, 1) == (0,)
     assert poisson.parse_fm_nz_spec("1", 4, 10) == (1,)
     assert poisson.parse_fm_nz_spec("0:2", 4, 2) == (0, 1)
-    with pytest.raises(ValueError, match="mumax FM has 1"):
-        poisson.parse_fm_nz_spec("0:2", 4, 1)
+    assert poisson.parse_fm_nz_spec("0:2", 4, 1) == (0, 1)
+    assert poisson.parse_fm_nz_spec("0:8", 8) == tuple(range(8))
 
 
 def test_map_layer_broadcast(fake_raw_solver):
@@ -543,6 +543,222 @@ def test_map_layer_range(fake_raw_solver):
     frame = solver.iterate()
     np.testing.assert_allclose(frame.jmod[:, 0, ...], 1.0)
     np.testing.assert_allclose(frame.jmod[:, 1, ...], 2.0)
+
+
+def test_poisson_fm_layers_example_checks():
+    """2 Pt + 8×5 nm FM exports: exponential and averages, packed and 2 nm."""
+
+    import runpy
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "examples" / "poisson_fm_layers.py"
+    runpy.run_path(str(script), run_name="__main__")
+
+
+def test_layer_count_defaults_to_selected_poisson_layers(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.array([[1e-3, 0.0, 0.0]], dtype=np.float64),
+        fm_nz="0:2",
+    )
+    assert solver.fm_mumax_nz == 2
+    assert solver.jmod_profile == "sample"
+    assert solver.output_shape[1] == 2
+
+
+def test_solver_average_collapses_two_poisson_layers(fake_raw_solver):
+    cz = 5e-9
+    decay = 8e-9
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.array([[1e-3, 0.0, 0.0]], dtype=np.float64),
+        fm_nz="0:2",
+        fm_mumax_nz=1,
+        jmod_profile="average",
+    )
+    frame = solver.iterate()
+    assert frame.jmod.shape == (3, 1, 4, 5)
+    np.testing.assert_allclose(frame.jcur, 1.5)
+    factor0 = poisson.fm_injection_decay_factor(0, cz, decay)
+    sheet = poisson.exponential_integral(0.0, 2 * cz, decay)
+    expected = (1.0 / factor0) * (sheet / (2 * cz))
+    np.testing.assert_allclose(frame.jmod, expected, rtol=1e-5)
+
+
+def test_solver_exponential_spreads_two_layers_over_eight(fake_raw_solver):
+    solver = poisson.CudaPoissonSolver(
+        contact_potentials=np.array([[1e-3, 0.0, 0.0]], dtype=np.float64),
+        fm_nz="0:2",
+        fm_mumax_nz=8,
+        jmod_profile="exponential",
+    )
+    frame = solver.iterate()
+    assert frame.jmod.shape == (3, 8, 4, 5)
+    assert frame.jmod[0, 0, 0, 0] > frame.jmod[0, -1, 0, 0]
+    np.testing.assert_allclose(frame.jcur[0, :4], 1.0)
+    np.testing.assert_allclose(frame.jcur[0, 4:], 2.0)
+    assert solver.fm_cellsize_z == pytest.approx(solver.cellsize[2] / 4)
+
+
+def test_magnetization_from_thicker_llg_stack(fake_raw_solver):
+    shape = (3, 4, 5)
+    region = np.ones(shape, dtype=np.int8)
+    region[1:] = 2
+    contact_id = np.zeros(shape, dtype=np.int8)
+    sigma = np.ones(shape, dtype=np.float32)
+    spec = poisson.WorldSpec(
+        shape=shape,
+        cellsize=(1.0, 2.0, 5e-9),
+        first_r2_layer=1,
+        theta_sh=0.2,
+        decay_length=8e-9,
+        region=region,
+        contact_id=contact_id,
+        sigma=sigma,
+    )
+    solver = poisson.CudaPoissonSolver(
+        world=spec,
+        contact_potentials=np.array([[1e-3]], dtype=np.float64),
+        fm_nz="0:2",
+        fm_mumax_nz=8,
+        jmod_profile="exponential",
+        amr_enabled=True,
+        amr_ratio=0.05,
+    )
+    m = np.zeros((3, 8, 4, 5), dtype=np.float32)
+    m[2, :4, ...] = 1.0
+    m[0, 4:, ...] = 1.0
+    solver.iterate(magnetization=m)
+    mag = solver._impl.last_magnetization
+    assert mag.shape == (3, 2, 4, 5)
+    assert float(mag[2, 0, 0, 0]) > 0.9
+    assert float(mag[0, 1, 0, 0]) > 0.9
+
+
+def _decayed_fm_stack(n_fm, cz, decay_length, amplitude=1.0):
+    jmod = np.zeros((3, n_fm, 1, 1), dtype=np.float32)
+    jcur = np.zeros_like(jmod)
+    for layer in range(n_fm):
+        factor = poisson.fm_injection_decay_factor(layer, cz, decay_length)
+        jmod[0, layer, 0, 0] = np.float32(amplitude * factor)
+        jcur[0, layer, 0, 0] = np.float32(layer + 1)
+    return jmod, jcur
+
+
+def test_map_fm_currents_profiles():
+    cz = 2e-9
+    decay = 4e-9
+    n_fm = 8
+    jmod, jcur = _decayed_fm_stack(n_fm, cz, decay)
+    amplitude = 1.0
+
+    two = (0, 1)
+    copied_jmod, copied_jcur = poisson.map_fm_currents(
+        jmod,
+        jcur,
+        source_layers=two,
+        n_out=2,
+        poisson_cz=cz,
+        fm_cz=cz,
+        decay_length=decay,
+        jmod_profile="sample",
+    )
+    np.testing.assert_allclose(copied_jmod[0, :, 0, 0], jmod[0, :2, 0, 0])
+    np.testing.assert_allclose(copied_jcur[0, :, 0, 0], [1.0, 2.0])
+
+    one_cz = poisson.resolve_fm_cellsize_z(two, 1, cz)
+    assert one_cz == pytest.approx(2 * cz)
+    exp_one, jcur_one = poisson.map_fm_currents(
+        jmod,
+        jcur,
+        source_layers=two,
+        n_out=1,
+        poisson_cz=cz,
+        fm_cz=one_cz,
+        decay_length=decay,
+        jmod_profile="exponential",
+    )
+    avg_one, _ = poisson.map_fm_currents(
+        jmod,
+        jcur,
+        source_layers=two,
+        n_out=1,
+        poisson_cz=cz,
+        fm_cz=one_cz,
+        decay_length=decay,
+        jmod_profile="average",
+    )
+    np.testing.assert_allclose(exp_one, avg_one)
+    np.testing.assert_allclose(jcur_one[0, 0, 0, 0], 1.5)
+    expected_sheet = amplitude * poisson.exponential_integral(0.0, 2 * cz, decay)
+    np.testing.assert_allclose(exp_one[0, 0, 0, 0] * one_cz, expected_sheet)
+
+    eight_cz = poisson.resolve_fm_cellsize_z(two, 8, cz)
+    assert eight_cz == pytest.approx(2 * cz / 8)
+    exp_eight, jcur_eight = poisson.map_fm_currents(
+        jmod,
+        jcur,
+        source_layers=two,
+        n_out=8,
+        poisson_cz=cz,
+        fm_cz=eight_cz,
+        decay_length=decay,
+        jmod_profile="exponential",
+    )
+    avg_eight, _ = poisson.map_fm_currents(
+        jmod,
+        jcur,
+        source_layers=two,
+        n_out=8,
+        poisson_cz=cz,
+        fm_cz=eight_cz,
+        decay_length=decay,
+        jmod_profile="average",
+    )
+    assert exp_eight[0, 0, 0, 0] > exp_eight[0, -1, 0, 0]
+    np.testing.assert_allclose(avg_eight[0, 0, 0, 0], avg_eight[0, -1, 0, 0])
+    np.testing.assert_allclose(jcur_eight[0, :4, 0, 0], 1.0)
+    np.testing.assert_allclose(jcur_eight[0, 4:, 0, 0], 2.0)
+    exp_sheet = float(np.sum(exp_eight[0, :, 0, 0]) * eight_cz)
+    avg_sheet = float(np.sum(avg_eight[0, :, 0, 0]) * eight_cz)
+    np.testing.assert_allclose(exp_sheet, expected_sheet)
+    np.testing.assert_allclose(avg_sheet, expected_sheet)
+
+    full_jmod, full_jcur = poisson.map_fm_currents(
+        jmod,
+        jcur,
+        source_layers=tuple(range(n_fm)),
+        n_out=n_fm,
+        poisson_cz=cz,
+        fm_cz=cz,
+        decay_length=decay,
+        jmod_profile="sample",
+    )
+    np.testing.assert_allclose(full_jmod, jmod)
+    np.testing.assert_allclose(full_jcur, jcur)
+
+
+def test_build_fgat_world_layer_and_material_controls():
+    spec = poisson.build_fgat_world_spec(
+        n_pt_layers=2,
+        n_fm_layers=8,
+        nx=32,
+        ny=32,
+        cellsize=(8e-9, 8e-9, 2e-9),
+        decay_length=4e-9,
+        theta_sh=0.15,
+        sigma_pt=1.5e6,
+        sigma_fm=4.0e5,
+        void_locations=(),
+        contact_edge_depth_cells=10,
+    )
+    assert spec.shape == (10, 32, 32)
+    assert spec.first_r2_layer == 2
+    assert spec.cellsize[2] == pytest.approx(2e-9)
+    assert spec.decay_length == pytest.approx(4e-9)
+    assert spec.theta_sh == pytest.approx(0.15)
+    assert np.all(spec.region[:2] == 1)
+    assert np.all(spec.region[2:] == 2)
+    assert spec.sigma[0, 0, 0] == np.float32(1.5e6)
+    assert spec.sigma[2, 0, 0] == np.float32(4.0e5)
 
 
 def test_map_height_resample(fake_raw_solver):

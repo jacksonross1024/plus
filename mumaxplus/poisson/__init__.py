@@ -1,5 +1,13 @@
 """Persistent CUDA Poisson solver utilities."""
 
+from .fm_export import (
+    exponential_integral,
+    exponential_interval_mean,
+    fm_injection_decay_factor,
+    map_fm_currents,
+    resample_stacked_layers,
+    resolve_fm_cellsize_z,
+)
 from .solver import (
     ContactLayout,
     CudaPoissonSolver,
@@ -39,8 +47,14 @@ __all__ = [
     "load_contact_potentials",
     "load_signal_file_to_contact_potentials",
     "num_contacts_from_world_spec",
+    "exponential_integral",
+    "exponential_interval_mean",
+    "fm_injection_decay_factor",
+    "map_fm_currents",
     "parse_fm_export_layers",
     "parse_fm_nz_spec",
+    "resample_stacked_layers",
+    "resolve_fm_cellsize_z",
     "resolve_contact_layout",
     "resolve_hall_contact_geometry",
     "world_spec_from_manifest",
