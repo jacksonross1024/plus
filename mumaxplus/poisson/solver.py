@@ -21,6 +21,12 @@ import warnings
 import numpy as np
 
 from mumaxplus import _cpp
+from mumaxplus.poisson.fm_export import (
+    JMOD_PROFILES,
+    map_fm_currents,
+    resample_stacked_layers,
+    resolve_fm_cellsize_z,
+)
 
 
 @dataclass(frozen=True)
@@ -170,8 +176,8 @@ class PoissonStepResult:
     """Current-density frames returned by one Poisson iteration.
 
     ``jmod`` and ``jcur`` are shaped ``(3, nz_export, ny, nx)`` (mumax+ vector
-    layout), after applying the layer/height export configured on
-    :class:`CudaPoissonSolver`. FM layer index ``0`` is at the Pt interface.
+    layout), after the layer export configured on :class:`CudaPoissonSolver`.
+    LLG layer ``0`` is at the Pt interface.
     """
 
     jmod: np.ndarray
@@ -738,6 +744,10 @@ def build_fgat_world_spec(
     shape: Tuple[int, int, int] = DEFAULT_FGAT_SHAPE,
     cellsize: Tuple[float, float, float] = DEFAULT_FGAT_CELLSIZE,
     first_r2_layer: int = DEFAULT_FGAT_FIRST_R2_LAYER,
+    n_pt_layers: Optional[int] = None,
+    n_fm_layers: Optional[int] = None,
+    nx: Optional[int] = None,
+    ny: Optional[int] = None,
     theta_sh: float = DEFAULT_FGAT_THETA_SH,
     decay_length: float = DEFAULT_FGAT_DECAY_LENGTH,
     sigma_pt: float = DEFAULT_FGAT_SIGMA_PT,
@@ -755,12 +765,32 @@ def build_fgat_world_spec(
 ) -> WorldSpec:
     """Build an in-memory FGaT Poisson world with flexible symmetric contacts.
 
+    The grid is ``shape`` as ``(nz, ny, nx)`` unless ``nx``, ``ny``,
+    ``n_pt_layers``, or ``n_fm_layers`` override it. ``n_pt_layers`` heavy-metal
+    cells sit under ``n_fm_layers`` ferromagnet cells. Conductivities, the spin
+    Hall angle, and ``decay_length`` are the material constants stored on the
+    returned :class:`WorldSpec`.
+
     ``void_sigma`` controls nonmagnetic void/filler cells (``region==0``):
     ``0.0`` keeps insulating holes; ``>0`` makes them high-resistance scalar
     conductors without AMR/AHE/THE.
     """
 
-    nz, ny, nx = tuple(int(v) for v in shape)
+    nz, ny_shape, nx_shape = tuple(int(v) for v in shape)
+    if ny is not None:
+        ny_shape = int(ny)
+    if nx is not None:
+        nx_shape = int(nx)
+    if n_pt_layers is not None or n_fm_layers is not None:
+        n_pt = int(first_r2_layer if n_pt_layers is None else n_pt_layers)
+        n_fm = int(nz - n_pt if n_fm_layers is None else n_fm_layers)
+        if n_pt <= 0 or n_fm <= 0:
+            raise ValueError(
+                f"n_pt_layers and n_fm_layers must be > 0, got {n_pt} and {n_fm}"
+            )
+        first_r2_layer = n_pt
+        nz = n_pt + n_fm
+    ny, nx = ny_shape, nx_shape
     cx, cy, cz = tuple(float(v) for v in cellsize)
     if nx <= 0 or ny <= 0 or nz <= 0:
         raise ValueError("shape entries must be > 0")
@@ -1100,20 +1130,26 @@ def _fm_slice_z_string(first_r2_layer: int) -> str:
 def parse_fm_nz_spec(
     spec: str,
     n_poisson_fm: int,
-    fm_mumax_nz: int = 1,
+    fm_mumax_nz: Optional[int] = None,
 ) -> Tuple[int, ...]:
-    """Parse ``--fm-nz`` layer-export specification.
+    """Parse a Poisson FM layer selection.
 
     Forms
     -----
-    ``n`` : Poisson layer ``n`` (0 = Pt interface), broadcast to all mumax+ z cells.
-    ``ni:nf`` : Poisson layers ``ni`` … ``nf - 1`` one-to-one with mumax+ z cells.
+    ``n``
+        Poisson layer ``n`` (``0`` is the Pt interface).
+    ``ni:nf``
+        Poisson layers ``ni`` … ``nf - 1``.
+
+    The selection is independent of the LLG layer count. ``fm_mumax_nz`` is
+    accepted for compatibility and is not required to equal the number of
+    selected layers.
     """
 
     text = str(spec).strip()
     if not text:
         raise ValueError("fm-nz must not be empty")
-    if fm_mumax_nz <= 0:
+    if fm_mumax_nz is not None and int(fm_mumax_nz) <= 0:
         raise ValueError("fm_mumax_nz must be > 0")
     parts = [int(p.strip()) for p in text.split(":")]
     if len(parts) == 1:
@@ -1122,14 +1158,8 @@ def parse_fm_nz_spec(
         return (layer,)
     if len(parts) == 2:
         ni, nf = parts
-        layers = _poisson_layer_range(ni, nf, n_poisson_fm)
-        if len(layers) != fm_mumax_nz:
-            raise ValueError(
-                f"fm-nz range {ni}:{nf} selects {len(layers)} Poisson layer(s), "
-                f"but mumax FM has {fm_mumax_nz} z cell(s)"
-            )
-        return layers
-    raise ValueError("fm-nz must be n or ni:nf (e.g. 0 or 0:1)")
+        return _poisson_layer_range(ni, nf, n_poisson_fm)
+    raise ValueError("fm-nz must be n or ni:nf (e.g. 0 or 0:2)")
 
 
 def _validate_poisson_layer(layer: int, n_poisson_fm: int) -> None:
@@ -1334,13 +1364,22 @@ class CudaPoissonSolver:
     """Persistent CUDA Poisson solver returning one current frame per call.
 
     The solver loads the full contact-potential series at construction, keeps
-    the CUDA PCG warm start alive across ``iterate`` calls, and returns
-    ``float32`` ``jmod`` and ``jcur`` already mapped to the requested mumax+ FM
-    z grid. Layer export selects Poisson FM layer indices; height export samples
-    the Poisson FM stack at mumax+ cell midpoints in physical z.
+    the CUDA warm start alive across ``iterate`` calls, and returns ``float32``
+    ``jmod`` and ``jcur`` mapped onto the requested mumax+ FM z grid.
+
+    ``fm_nz`` chooses which Poisson FM layers to export (``"0:2"`` is the two
+    cells at the Pt interface). ``fm_mumax_nz`` is the number of LLG layers
+    those currents are applied to, and the two counts do not have to match.
+    ``jmod_profile`` controls the injection profile on that LLG grid:
+    ``sample`` resamples the Poisson cell values, ``exponential`` evaluates
+    ``exp(-z/λ)`` on each LLG cell's real-space interval, and ``average``
+    spreads the integrated exponential evenly so every layer is equal and the
+    thickness-integrated injection is unchanged. Height export with
+    ``jmod_profile="sample"`` still samples the stack at LLG cell midpoints.
 
     All FM-layer postprocessing (raw ``jcur``, Pt injection into ``jmod``, decay)
-    runs on the full Poisson FM stack inside the C++ solver.
+    runs on the full Poisson FM stack inside the C++ solver. The LLG remapping
+    above is applied to those frames afterwards.
 
     This class is intentionally separate from ``mumaxplus.PoissonSystem``. Its
     world geometry can come from the packaged default manifest, an explicit
@@ -1368,7 +1407,10 @@ class CudaPoissonSolver:
         skip_threshold: float = 1e-5,
         fm_nz: Optional[str] = None,
         fm_height: Optional[float] = None,
-        fm_mumax_nz: int = 1,
+        fm_mumax_nz: Optional[int] = None,
+        jmod_profile: str = "sample",
+        fm_cellsize_z: Optional[float] = None,
+        jmod_depth: Optional[float] = None,
         jmod_slice_x: str = "",
         jmod_slice_y: str = "",
         jmod_slice_z: Optional[str] = None,
@@ -1521,6 +1563,9 @@ class CudaPoissonSolver:
             fm_nz=fm_nz,
             fm_height=fm_height,
             fm_mumax_nz=fm_mumax_nz,
+            jmod_profile=jmod_profile,
+            fm_cellsize_z=fm_cellsize_z,
+            jmod_depth=jmod_depth,
         )
         if applied_field is not None:
             self.set_applied_field(applied_field)
@@ -1540,7 +1585,10 @@ class CudaPoissonSolver:
         skip_threshold: float = 1e-5,
         fm_nz: Optional[str] = None,
         fm_height: Optional[float] = None,
-        fm_mumax_nz: int = 1,
+        fm_mumax_nz: Optional[int] = None,
+        jmod_profile: str = "sample",
+        fm_cellsize_z: Optional[float] = None,
+        jmod_depth: Optional[float] = None,
         jmod_slice_x: str = "",
         jmod_slice_y: str = "",
         jmod_slice_z: Optional[str] = None,
@@ -1651,6 +1699,9 @@ class CudaPoissonSolver:
             fm_nz=fm_nz,
             fm_height=fm_height,
             fm_mumax_nz=fm_mumax_nz,
+            jmod_profile=jmod_profile,
+            fm_cellsize_z=fm_cellsize_z,
+            jmod_depth=jmod_depth,
         )
         if applied_field is not None:
             obj.set_applied_field(applied_field)
@@ -1661,24 +1712,46 @@ class CudaPoissonSolver:
         *,
         fm_nz: Optional[str],
         fm_height: Optional[float],
-        fm_mumax_nz: int,
+        fm_mumax_nz: Optional[int],
+        jmod_profile: str,
+        fm_cellsize_z: Optional[float],
+        jmod_depth: Optional[float],
     ) -> None:
         if fm_nz is not None and fm_height is not None:
             raise ValueError("provide either fm_nz or fm_height, not both")
-        if int(fm_mumax_nz) <= 0:
+        if fm_height is not None and fm_cellsize_z is not None:
+            raise ValueError("provide either fm_height or fm_cellsize_z, not both")
+        if fm_mumax_nz is not None and int(fm_mumax_nz) <= 0:
             raise ValueError("fm_mumax_nz must be > 0")
+        profile = str(jmod_profile).strip().lower()
+        if profile not in JMOD_PROFILES:
+            raise ValueError(
+                "jmod_profile must be 'sample', 'exponential', or 'average', "
+                f"got {jmod_profile!r}"
+            )
+        if jmod_depth is not None and not (float(jmod_depth) > 0.0):
+            raise ValueError("jmod_depth must be > 0")
+        if fm_cellsize_z is not None and not (float(fm_cellsize_z) > 0.0):
+            raise ValueError("fm_cellsize_z must be > 0")
+        if profile in ("exponential", "average") and not (self.decay_length > 0.0):
+            raise ValueError(
+                "exponential and average jmod profiles require decay_length > 0"
+            )
 
-        self._fm_mumax_nz = int(fm_mumax_nz)
+        self._jmod_profile = profile
+        self._fm_cellsize_z_override = (
+            None if fm_cellsize_z is None else float(fm_cellsize_z)
+        )
+        self._jmod_depth = None if jmod_depth is None else float(jmod_depth)
         self._fm_export_mode = "full"
         self._fm_export_layers = tuple(range(self.fm_layer_count))
         self._fm_height = None
 
         if fm_nz is not None:
             self._fm_export_mode = "layer"
-            self._fm_export_layers = parse_fm_nz_spec(
-                fm_nz,
-                self.fm_layer_count,
-                self._fm_mumax_nz,
+            self._fm_export_layers = parse_fm_nz_spec(fm_nz, self.fm_layer_count)
+            self._fm_mumax_nz = (
+                len(self._fm_export_layers) if fm_mumax_nz is None else int(fm_mumax_nz)
             )
             return
 
@@ -1687,6 +1760,7 @@ class CudaPoissonSolver:
                 raise ValueError("fm_height must be > 0")
             self._fm_export_mode = "height"
             self._fm_height = float(fm_height)
+            self._fm_mumax_nz = 1 if fm_mumax_nz is None else int(fm_mumax_nz)
             return
 
         self._fm_mumax_nz = self.fm_layer_count
@@ -1722,10 +1796,34 @@ class CudaPoissonSolver:
         return self._fm_export_mode
 
     @property
+    def jmod_profile(self) -> str:
+        """How exported ``jmod`` is built: ``sample``, ``exponential``, or ``average``."""
+
+        return self._jmod_profile
+
+    @property
+    def jmod_depth(self) -> Optional[float]:
+        """Upper limit [m] of the ``average`` integral, or ``None`` for the default."""
+
+        return self._jmod_depth
+
+    @property
     def fm_mumax_nz(self) -> int:
         """Number of z cells in returned mumax+ current frames."""
 
         return self._fm_mumax_nz
+
+    @property
+    def fm_cellsize_z(self) -> float:
+        """Z cell size [m] of each exported LLG current layer."""
+
+        return resolve_fm_cellsize_z(
+            self._fm_export_layers,
+            self._fm_mumax_nz,
+            self.cellsize[2],
+            fm_height=self._fm_height,
+            fm_cellsize_z=self._fm_cellsize_z_override,
+        )
 
     @property
     def fm_export_layers(self) -> Tuple[int, ...]:
@@ -2237,19 +2335,15 @@ class CudaPoissonSolver:
                 self._average_magnetization_over_z(arr)
             )
 
-        # mumax nz > Poisson FM layers: mode-specific downsample into the stack.
+        # mumax nz > Poisson FM layers: place LLG cells by real-space z.
         if self._fm_export_mode == "full":
             raise ValueError(
                 f"magnetization nz={nz_m} does not match Poisson FM layers {n_fm}"
             )
 
-        if self._fm_export_mode == "layer":
+        if self._fm_export_mode == "layer" and nz_m == len(self._fm_export_layers):
             out = np.zeros((3, n_fm, ny, nx), dtype=np.float32)
             layers = self._fm_export_layers
-            if nz_m != len(layers):
-                raise ValueError(
-                    f"magnetization nz={nz_m} does not match selected layers {layers}"
-                )
             for i, layer in enumerate(layers):
                 out[:, layer, :, :] = arr[:, i, :, :]
             selected = sorted(set(layers))
@@ -2260,24 +2354,39 @@ class CudaPoissonSolver:
                 out[:, layer, :, :] = out[:, nearest, :, :]
             return np.ascontiguousarray(out, dtype=np.float32)
 
-        if self._fm_height is None:
-            raise RuntimeError("height export is missing fm_height")
+        lo, hi, weight = self._llg_sample_tables(nz_m)
         out = np.empty((3, n_fm, ny, nx), dtype=np.float32)
-        fm_cz = self._fm_height / max(nz_m, 1)
+        for iz in range(n_fm):
+            wl = np.float32(1.0) - weight[iz]
+            out[:, iz, ...] = wl * arr[:, int(lo[iz]), ...] + weight[iz] * arr[:, int(hi[iz]), ...]
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    def _llg_sample_tables(self, src_nz: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Linear sample of an LLG z stack at each Poisson FM cell center."""
+
+        n_fm = self.fm_layer_count
+        src_nz = int(src_nz)
+        total_height = self._fm_mumax_nz * self.fm_cellsize_z
+        fm_cz = total_height / max(src_nz, 1)
         poisson_cz = self.cellsize[2]
+        lo = np.empty(n_fm, dtype=np.int32)
+        hi = np.empty(n_fm, dtype=np.int32)
+        weight = np.empty(n_fm, dtype=np.float32)
         for iz in range(n_fm):
             z_mid = (iz + 0.5) * poisson_cz
             pos = z_mid / max(fm_cz, 1e-30) - 0.5
             if pos <= 0.0:
-                out[:, iz, ...] = arr[:, 0, ...]
-            elif pos >= nz_m - 1:
-                out[:, iz, ...] = arr[:, -1, ...]
+                lo[iz] = hi[iz] = 0
+                weight[iz] = 0.0
+            elif pos >= src_nz - 1:
+                lo[iz] = hi[iz] = src_nz - 1
+                weight[iz] = 0.0
             else:
-                lo = int(np.floor(pos))
-                hi = lo + 1
-                weight = np.float32(pos - lo)
-                out[:, iz, ...] = (1.0 - weight) * arr[:, lo, ...] + weight * arr[:, hi, ...]
-        return np.ascontiguousarray(out, dtype=np.float32)
+                lo_i = int(np.floor(pos))
+                lo[iz] = lo_i
+                hi[iz] = lo_i + 1
+                weight[iz] = np.float32(pos - lo_i)
+        return lo, hi, weight
 
     def _device_magnetization_mapping(
         self,
@@ -2292,6 +2401,9 @@ class CudaPoissonSolver:
             n_fm,
             self._fm_export_mode,
             self._fm_height,
+            self._fm_cellsize_z_override,
+            self._jmod_profile,
+            self._fm_mumax_nz,
             tuple(self._fm_export_layers) if self._fm_export_layers is not None else None,
         )
         cached = getattr(self, "_device_mag_mapping_cache", None)
@@ -2313,12 +2425,8 @@ class CudaPoissonSolver:
             raise ValueError(
                 f"magnetization nz={src_nz} does not match Poisson FM layers {n_fm}"
             )
-        elif self._fm_export_mode == "layer":
+        elif self._fm_export_mode == "layer" and src_nz == len(self._fm_export_layers):
             layers = self._fm_export_layers
-            if src_nz != len(layers):
-                raise ValueError(
-                    f"magnetization nz={src_nz} does not match selected layers {layers}"
-                )
             selected = sorted(set(layers))
             lo = np.empty(n_fm, dtype=np.int32)
             for layer in range(n_fm):
@@ -2327,27 +2435,7 @@ class CudaPoissonSolver:
             weight = np.zeros(n_fm, dtype=np.float32)
             result = (lo, lo.copy(), weight, False)
         else:
-            if self._fm_height is None:
-                raise RuntimeError("height export is missing fm_height")
-            lo = np.empty(n_fm, dtype=np.int32)
-            hi = np.empty(n_fm, dtype=np.int32)
-            weight = np.empty(n_fm, dtype=np.float32)
-            fm_cz = self._fm_height / max(src_nz, 1)
-            poisson_cz = self.cellsize[2]
-            for iz in range(n_fm):
-                z_mid = (iz + 0.5) * poisson_cz
-                pos = z_mid / max(fm_cz, 1e-30) - 0.5
-                if pos <= 0.0:
-                    lo[iz] = hi[iz] = 0
-                    weight[iz] = 0.0
-                elif pos >= src_nz - 1:
-                    lo[iz] = hi[iz] = src_nz - 1
-                    weight[iz] = 0.0
-                else:
-                    lo_i = int(np.floor(pos))
-                    lo[iz] = lo_i
-                    hi[iz] = lo_i + 1
-                    weight[iz] = np.float32(pos - lo_i)
+            lo, hi, weight = self._llg_sample_tables(src_nz)
             result = (lo, hi, weight, False)
 
         self._device_mag_mapping_cache = (cache_key, result)
@@ -2361,14 +2449,7 @@ class CudaPoissonSolver:
             return arr
 
         if self._fm_export_mode == "layer":
-            layers = self._fm_export_layers
-            if len(layers) == 1:
-                slab = arr[:, layers[0] : layers[0] + 1, ...]
-                return np.ascontiguousarray(
-                    np.broadcast_to(slab, (3, self._fm_mumax_nz, ny, nx)).copy(),
-                    dtype=np.float32,
-                )
-            return np.ascontiguousarray(arr[:, list(layers), ...], dtype=np.float32)
+            return resample_stacked_layers(arr, self._fm_export_layers, self._fm_mumax_nz)
 
         if self._fm_height is None:
             raise RuntimeError("height export is missing fm_height")
@@ -2379,6 +2460,23 @@ class CudaPoissonSolver:
             z_mid = (iz + 0.5) * fm_cz
             out[:, iz, ...] = _interp_poisson_stack_at_z(arr, z_mid, poisson_cz)
         return out
+
+    def _export_currents(self, jmod: np.ndarray, jcur: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Map full-stack Poisson currents onto the configured LLG grid."""
+
+        if self._jmod_profile == "sample" and self._fm_export_mode == "height":
+            return self._map_fm_export(jmod), self._map_fm_export(jcur)
+        return map_fm_currents(
+            jmod,
+            jcur,
+            source_layers=self._fm_export_layers,
+            n_out=self._fm_mumax_nz,
+            poisson_cz=self.cellsize[2],
+            fm_cz=self.fm_cellsize_z,
+            decay_length=self.decay_length,
+            jmod_profile=self._jmod_profile,
+            jmod_depth=self._jmod_depth,
+        )
 
     def iterate(
         self,
@@ -2465,8 +2563,7 @@ class CudaPoissonSolver:
             raw = self._impl.iterate()
             timing_native_call_s = time.perf_counter() - t_native0
         t_out0 = time.perf_counter()
-        jmod = self._map_fm_export(raw["jmod"])
-        jcur = self._map_fm_export(raw["jcur"])
+        jmod, jcur = self._export_currents(raw["jmod"], raw["jcur"])
         timing_python_output_map_s = time.perf_counter() - t_out0
         stats = _stats_from_dict(raw["stats"])
         stats = replace(
@@ -2533,4 +2630,7 @@ class CudaPoissonSolver:
             "fm_export_mode": self.fm_export_mode,
             "fm_export_layers": self.fm_export_layers,
             "fm_height": self.fm_height,
+            "fm_cellsize_z": self.fm_cellsize_z,
+            "jmod_profile": self.jmod_profile,
+            "jmod_depth": self.jmod_depth,
         }
